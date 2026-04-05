@@ -1,17 +1,15 @@
-
-from collections import deque
+from collections import OrderedDict, deque
 from libcachesim import CommonCacheParams, Request
 
-SMALL_RATIO  = 0.10   # fraction of cache reserved for S
-GHOST_RATIO  = 0.10   # ghost queue
-MAX_FREQ     = 3      # counter cap
+SMALL_RATIO = 0.10   # fraction of cache reserved for S
+GHOST_RATIO = 0.10   # ghost queue
+MAX_FREQ    = 3      # counter cap
 
 class S3FifoCache:
-
     def __init__(self, cache_size: int):
         self.cache_size = cache_size
         self.s_max = max(1, int(cache_size * SMALL_RATIO))
-        self.m_max = cache_size - self.s_max
+        self.m_max = max(1, cache_size - self.s_max)
         self.g_max = max(1, int(cache_size * GHOST_RATIO))
 
         self.s_used = 0
@@ -20,107 +18,122 @@ class S3FifoCache:
         self.s_queue: deque[int] = deque()
         self.m_queue: deque[int] = deque()
 
-        self.ghost: dict[int, None] = {}
+        self.ghost: OrderedDict[int, None] = OrderedDict()
 
-        self.freq:     dict[int, int] = {}
+        self.freq: dict[int, int] = {}
         self.obj_size: dict[int, int] = {}
-
+        self.where: dict[int, str] = {}
 
     def add_to_ghost(self, obj_id: int) -> None:
         if obj_id in self.ghost:
+            self.ghost.move_to_end(obj_id)
             return
-        if len(self.ghost) >= self.g_max:
-            oldest = next(iter(self.ghost))
-            del self.ghost[oldest]
         self.ghost[obj_id] = None
-
-    def evict_from_s(self) -> int:
-        obj_id = self.s_queue.popleft()
-        size   = self.obj_size.pop(obj_id, 0)
-        f      = self.freq.pop(obj_id, 0)
-        self.s_used -= size
-
-        if f >= 1:
-            self.make_room_in_m(size)
-            self.m_queue.append(obj_id)
-            self.m_used += size
-            self.obj_size[obj_id] = size
-            self.freq[obj_id] = min(f, MAX_FREQ)
-            return 0
-
-        self.add_to_ghost(obj_id)
-        return obj_id
+        if len(self.ghost) > self.g_max:
+            self.ghost.popitem(last=False)
 
     def evict_from_m(self) -> int:
-        obj_id = self.m_queue.popleft()
-        size   = self.obj_size.pop(obj_id, 0)
-        self.freq.pop(obj_id, None)
-        self.m_used -= size
-        return obj_id
+        while self.m_queue:
+            obj_id = self.m_queue.popleft()
+            if self.where.get(obj_id) != "M":
+                continue
 
-    def make_room_in_m(self, needed: int) -> None:
-        while self.m_used + needed > self.m_max and self.m_queue:
-            self.evict_from_m()
+            size = self.obj_size.pop(obj_id, 0)
+            self.freq.pop(obj_id, None)
+            self.where.pop(obj_id, None)
+            self.m_used -= size
+            return obj_id
+
+        return 0
 
     def on_hit(self, req: Request) -> None:
         obj_id = req.obj_id
-        if obj_id in self.freq:
-            self.freq[obj_id] = min(self.freq[obj_id] + 1, MAX_FREQ)
+        if obj_id in self.where:
+            self.freq[obj_id] = min(self.freq.get(obj_id, 0) + 1, MAX_FREQ)
 
     def on_miss(self, req: Request) -> None:
         obj_id = req.obj_id
-        size   = req.obj_size
+        size = req.obj_size
 
         if size > self.cache_size:
             return
 
         if obj_id in self.ghost:
             del self.ghost[obj_id]
-            self.make_room_in_m(size)
             self.m_queue.append(obj_id)
             self.m_used += size
+            self.where[obj_id] = "M"
             self.obj_size[obj_id] = size
             self.freq[obj_id] = 0
         else:
-            while self.s_used + size > self.s_max and self.s_queue:
-                self.evict_from_s()
-            while self.s_used + size > self.s_max:
-                self.evict_from_m()
             self.s_queue.append(obj_id)
             self.s_used += size
+            self.where[obj_id] = "S"
             self.obj_size[obj_id] = size
             self.freq[obj_id] = 0
 
     def evict(self, req: Request) -> int:
-        while self.s_queue:
-            evicted = self.evict_from_s()
-            if evicted != 0:
-                return evicted
+        while True:
+            while self.s_queue:
+                obj_id = self.s_queue[0]
 
-        if self.m_queue:
-            return self.evict_from_m()
+                if self.where.get(obj_id) != "S":
+                    self.s_queue.popleft()
+                    continue
 
-        return 0
+                size = self.obj_size[obj_id]
+                f = self.freq.get(obj_id, 0)
+
+                if f >= 1:
+                    if self.m_used + size > self.m_max and self.m_queue:
+                        victim = self.evict_from_m()
+                        if victim != 0:
+                            return victim
+
+                    self.s_queue.popleft()
+                    self.s_used -= size
+                    self.m_queue.append(obj_id)
+                    self.m_used += size
+                    self.where[obj_id] = "M"
+                    self.freq[obj_id] = min(f, MAX_FREQ)
+                    continue
+
+                self.s_queue.popleft()
+                self.s_used -= size
+                self.where.pop(obj_id, None)
+                self.obj_size.pop(obj_id, None)
+                self.freq.pop(obj_id, None)
+                self.add_to_ghost(obj_id)
+                return obj_id
+
+            victim = self.evict_from_m()
+            if victim != 0:
+                return victim
+
+            return 0
 
     def on_remove(self, obj_id: int) -> None:
-        size = self.obj_size.pop(obj_id, None)
-        if size is None:
+
+        where = self.where.pop(obj_id, None)
+        if where is None:
             return
 
+        size = self.obj_size.pop(obj_id, 0)
         self.freq.pop(obj_id, None)
 
-        try:
-            self.s_queue.remove(obj_id)
+        if where == "S":
             self.s_used -= size
-            return
-        except ValueError:
-            pass
-
-        try:
-            self.m_queue.remove(obj_id)
+            try:
+                self.s_queue.remove(obj_id)
+            except ValueError:
+                pass
+            self.add_to_ghost(obj_id)
+        elif where == "M":
             self.m_used -= size
-        except ValueError:
-            pass
+            try:
+                self.m_queue.remove(obj_id)
+            except ValueError:
+                pass
 
 def init_hook(common_cache_params: CommonCacheParams) -> S3FifoCache:
     return S3FifoCache(common_cache_params.cache_size)
@@ -148,6 +161,7 @@ def free_hook(data: S3FifoCache) -> None:
     data.ghost.clear()
     data.freq.clear()
     data.obj_size.clear()
+    data.where.clear()
 
 if __name__ == "__main__":
     from pathlib import Path
