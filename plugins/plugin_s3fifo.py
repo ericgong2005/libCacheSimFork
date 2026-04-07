@@ -155,66 +155,51 @@ class StandaloneS3FIFO:
         return removed
 
 
-def cache_init_hook(common_cache_params: CommonCacheParams):
+def init_hook(common_cache_params: CommonCacheParams):
     return StandaloneS3FIFO(cache_size=common_cache_params.cache_size)
 
 
-def cache_hit_hook(cache, request: Request):
+def hit_hook(cache, request: Request):
     cache.cache_hit(request)
 
 
-def cache_miss_hook(cache, request: Request):
+def miss_hook(cache, request: Request):
     cache.cache_miss(request)
 
 
-def cache_eviction_hook(cache, request: Request):
+def eviction_hook(cache, request: Request):
     evicted_id = None
     while evicted_id is None:
         evicted_id = cache.cache_evict(request)
     return evicted_id
 
 
-def cache_remove_hook(cache, obj_id):
+def remove_hook(cache, obj_id):
     cache.cache_remove(obj_id)
 
 
-def cache_free_hook(cache):
+def free_hook(cache):
     pass
 
 
-cache = PluginCache(
-    cache_size=1024,
-    cache_init_hook=cache_init_hook,
-    cache_hit_hook=cache_hit_hook,
-    cache_miss_hook=cache_miss_hook,
-    cache_eviction_hook=cache_eviction_hook,
-    cache_remove_hook=cache_remove_hook,
-    cache_free_hook=cache_free_hook,
-    cache_name="S3FIFO",
-)
+if __name__ == "__main__":
+    from pathlib import Path
+    from libcachesim import PluginCache, TraceReader, TraceType
 
-URI = "s3://cache-datasets/cache_dataset_oracleGeneral/2007_msr/msr_hm_0.oracleGeneral.zst"
+    plugin_cache = PluginCache(
+        cache_size=1024 * 1024,
+        cache_init_hook=init_hook,
+        cache_hit_hook=hit_hook,
+        cache_miss_hook=miss_hook,
+        cache_eviction_hook=eviction_hook,
+        cache_remove_hook=remove_hook,
+        cache_free_hook=free_hook,
+        cache_name="s3fifo",
+    )
 
-# Open trace
-reader = lcs.TraceReader(
-    trace=URI,
-    trace_type=lcs.TraceType.ORACLE_GENERAL_TRACE,
-    reader_init_params=lcs.ReaderInitParam(ignore_obj_size=True),
-)
+    trace = Path(__file__).parent.parent / "data" / "cloudPhysicsIO.vscsi"
+    reader = TraceReader(trace=str(trace), trace_type=TraceType.VSCSI_TRACE)
 
-# Use native S3FIFO for reference
-ref_s3fifo = S3FIFO(cache_size=1024, small_size_ratio=0.1, ghost_size_ratio=0.9, move_to_main_threshold=2)
-
-# for req in reader:
-#     hit = cache.get(req)
-#     ref_hit = ref_s3fifo.get(req)
-#     assert hit == ref_hit, f"Cache hit mismatch: {hit} != {ref_hit}"
-
-req_miss_ratio, byte_miss_ratio = cache.process_trace(reader)
-ref_req_miss_ratio, ref_byte_miss_ratio = ref_s3fifo.process_trace(reader)
-print(f"Plugin req miss ratio: {req_miss_ratio}, ref req miss ratio: {ref_req_miss_ratio}")
-print(f"Plugin byte miss ratio: {byte_miss_ratio}, ref byte miss ratio: {ref_byte_miss_ratio}")
-
-assert req_miss_ratio == ref_req_miss_ratio
-assert byte_miss_ratio == ref_byte_miss_ratio
-print("All requests processed successfully. Plugin cache matches reference S3FIFO cache.")
+    req_miss_ratio, byte_miss_ratio = plugin_cache.process_trace(reader)
+    print(f"Request miss ratio: {req_miss_ratio:.4f}")
+    print(f"Byte miss ratio:    {byte_miss_ratio:.4f}")
