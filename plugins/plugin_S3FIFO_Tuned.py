@@ -1,21 +1,15 @@
 from collections import deque
 from libcachesim import CommonCacheParams, Request
+
 class FifoCache:
     """
-    S3-FIFO style policy (approximation suitable for PluginCache ordering constraints).
+    Tuned S3-FIFO variant:
+      - Larger probation region (small_ratio=0.20)
+      - Promote after 1 re-reference (threshold=1)
+      - Slightly stronger main counter (max=3)
 
-    Data structures:
-      - S (small/probation) FIFO list with quick demotion
-      - M (main/protected) FIFO list with reinsertion/second-chance via small counter
-      - G (ghost) remembers recently evicted from S; ghost hit => insert into M
-
-    Key behaviors:
-      - New inserts go to S unless in ghost (then to M).
-      - On hit in S: increment; if >= threshold, promote to M.
-      - Eviction prefers S (fast demotion of one-hit wonders); if S entry is "hot", it can be promoted instead.
-      - Eviction in M uses decrement-and-reinsert (FIFO reinsertion) until an entry's counter is 0.
-
-    This tracks the common "quick demotion + protected region" intuition.
+    Intended to improve hit rate on workloads with moderate reuse bursts
+    by moving useful items into M earlier.
     """
 
     class _Node:
@@ -67,40 +61,23 @@ class FifoCache:
             node.prev = node.next = None
             return node
 
-        def move_to_head(self, obj_id: int):
-            node = self.nodes.get(obj_id)
-            if node is None:
-                return
-            # unlink and relink at head
-            node.prev.next = node.next
-            node.next.prev = node.prev
-            node.next = self.head.next
-            node.prev = self.head
-            self.head.next.prev = node
-            self.head.next = node
-            # bytes unchanged
-
     def __init__(self, cache_size: int):
         from collections import deque
 
         self.cache_size = cache_size
-
         self.S = self._DLL()
         self.M = self._DLL()
 
-        # Ghost list (IDs only)
         self.G_q = deque()
         self.G_s: set[int] = set()
-        self.G_max = 200_000  # tune by workload scale
+        self.G_max = 200_000
 
-        # Parameters
-        self.small_ratio = 0.10
+        self.small_ratio = 0.20
         self.small_target = int(self.cache_size * self.small_ratio)
-        self.promote_threshold = 2
-        self.main_cnt_max = 2  # saturating counter
+        self.promote_threshold = 1
+        self.main_cnt_max = 3
 
-        # Required by free_hook: keep a dict of all resident objects
-        self.queue: dict[int, int] = {}  # obj_id -> size
+        self.queue: dict[int, int] = {}
 
     def _ghost_add(self, obj_id: int):
         self.G_s.add(obj_id)
@@ -109,33 +86,19 @@ class FifoCache:
             old = self.G_q.popleft()
             self.G_s.discard(old)
 
-    def _insert_S(self, obj_id: int, size: int):
-        node = self._Node(obj_id, size=size, cnt=0)
-        self.S.push_head(node)
-        self.queue[obj_id] = size
-
-    def _insert_M(self, obj_id: int, size: int, cnt: int = 1):
-        node = self._Node(obj_id, size=size, cnt=min(cnt, self.main_cnt_max))
-        self.M.push_head(node)
-        self.queue[obj_id] = size
-
     def on_hit(self, req: Request):
         obj_id = req.obj_id
         if obj_id in self.S.nodes:
             node = self.S.nodes[obj_id]
             node.cnt += 1
             if node.cnt >= self.promote_threshold:
-                # Promote to M
                 moved = self.S.remove(obj_id)
                 if moved is not None:
-                    moved.cnt = 1
+                    moved.cnt = min(2, self.main_cnt_max)
                     self.M.push_head(moved)
         elif obj_id in self.M.nodes:
             node = self.M.nodes[obj_id]
-            if node.cnt < self.main_cnt_max:
-                node.cnt += 1
-        else:
-            return
+            node.cnt = min(self.main_cnt_max, node.cnt + 1)
 
     def on_miss(self, req: Request):
         if req.obj_size > self.cache_size:
@@ -144,35 +107,34 @@ class FifoCache:
         size = req.obj_size
         if obj_id in self.G_s:
             self.G_s.discard(obj_id)
-            self._insert_M(obj_id, size, cnt=1)
+            node = self._Node(obj_id, size=size, cnt=2)
+            self.M.push_head(node)
         else:
-            self._insert_S(obj_id, size)
+            node = self._Node(obj_id, size=size, cnt=0)
+            self.S.push_head(node)
+        self.queue[obj_id] = size
 
     def evict(self, req: Request):
         if not self.queue:
             return 0
 
-        # Prefer evicting from S for fast demotion, unless S is small and M has entries.
-        prefer_S = self.S.bytes > self.small_target or self.M.empty()
+        # If probation is relatively large, still prefer evicting probation first.
+        prefer_S = (not self.S.empty()) and (self.S.bytes > self.small_target or self.M.empty())
 
-        if prefer_S and not self.S.empty():
-            # S eviction / promotion-on-evict
+        if prefer_S:
             while not self.S.empty():
                 cand = self.S.pop_tail()
                 if cand is None:
                     break
                 if cand.cnt >= self.promote_threshold:
-                    # Promote instead of evicting
-                    cand.cnt = 1
+                    cand.cnt = min(2, self.main_cnt_max)
                     self.M.push_head(cand)
                     continue
-                # Evict cand
                 vid = cand.obj_id
                 self.queue.pop(vid, None)
                 self._ghost_add(vid)
                 return vid
 
-        # Otherwise evict from M with reinsertion based on counter
         while not self.M.empty():
             cand = self.M.pop_tail()
             if cand is None:
@@ -185,18 +147,17 @@ class FifoCache:
             self.queue.pop(vid, None)
             return vid
 
-        # Fallback
         vid = next(iter(self.queue.keys()))
         self.on_remove(vid)
         return vid
 
     def on_remove(self, obj_id: int):
-        # Remove from whichever list it is in
         if obj_id in self.S.nodes:
             self.S.remove(obj_id)
         if obj_id in self.M.nodes:
             self.M.remove(obj_id)
         self.queue.pop(obj_id, None)
+
 
 def init_hook(common_cache_params: CommonCacheParams):
     return FifoCache(common_cache_params.cache_size)
