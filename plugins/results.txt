@@ -1,0 +1,52 @@
+plugin_ARC.py
+Request miss ratio: 0.8553
+Byte miss ratio: 0.9800
+
+plugin_BELADY.py
+Request miss ratio: 0.8646
+Byte miss ratio: 0.9813
+
+plugin_custom.py
+Request miss ratio: 0.8535
+Byte miss ratio:    0.9801
+
+plugin_fifo.py
+Request miss ratio: 0.8766
+Byte miss ratio: 0.9827
+
+plugin_GDSF.py
+Request miss ratio: 0.8377
+Byte miss ratio: 0.9790
+
+plugin_LRU.py
+Request miss ratio: 0.8646
+Byte miss ratio: 0.9813
+
+plugin_s3fifo_libcachesim.py
+Request miss ratio: 0.8468
+Byte miss ratio:    0.9793
+
+plugin_s3fifo.py
+Request miss ratio: 0.8490
+Byte miss ratio: 0.9794
+
+plugin_S3FIFO_Tuned.py
+Request miss ratio: 0.8475
+Byte miss ratio: 0.9792
+
+plugin_S3SIEVE.py
+Request miss ratio: 0.8507
+Byte miss ratio: 0.9796
+
+plugin_SIEVE_hot_reinsert.py
+Request miss ratio: 0.8445
+Byte miss ratio: 0.9789
+
+plugin_SIEVE_k_counter.py
+Request miss ratio: 0.8514
+Byte miss ratio: 0.9799
+
+plugin_SIEVE.py
+Request miss ratio: 0.8470
+Byte miss ratio: 0.9795
+
