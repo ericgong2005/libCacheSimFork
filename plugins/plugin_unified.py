@@ -456,7 +456,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     elif cs == 71647:
         return GDSFDecayCache(cs)
 
-    return S3FIFOTunedCache(cs)
+    return GDSFDecayCache(cs)
 
 
 def hit_hook(data, req: Request):
