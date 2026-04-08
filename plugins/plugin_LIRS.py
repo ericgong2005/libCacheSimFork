@@ -1,4 +1,4 @@
-from collections import deque
+from collections import deque, OrderedDict
 from libcachesim import CommonCacheParams, Request
 
 class LIRSCache:
