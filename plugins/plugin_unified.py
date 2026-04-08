@@ -2,84 +2,6 @@ from collections import deque, OrderedDict
 from libcachesim import CommonCacheParams, Request
 import math
 
-class GDSFCache:
-    """
-    GDSF-like (GreedyDual Size-Frequency) eviction for variable-size objects.
-
-    Core idea:
-      Maintain a key H(x) = L + freq(x)/size(x) for each object.
-      Evict smallest H; on eviction set global L = H(victim) (aging).
-
-    This is a widely used pattern for byte-constrained object caches.
-
-    Implementation:
-      - Min-heap of (H, version, obj_id)
-      - Dict obj_id -> (size, freq, H, version)
-      - Lazy deletion via versioning
-    """
-
-    def __init__(self, cache_size: int):
-        import heapq
-
-        self.cache_size = cache_size
-        self.queue: dict[int, tuple[int, int, float, int]] = {}  # obj_id -> (size, freq, H, ver)
-        self.heap: list[tuple[float, int, int]] = []  # (H, ver, obj_id)
-        self.L = 0.0
-        self._ver = 0
-        self._heapq = heapq
-
-    def _push(self, obj_id: int, size: int, freq: int):
-        self._ver += 1
-        H = self.L + (freq / max(size, 1))
-        self.queue[obj_id] = (size, freq, H, self._ver)
-        self._heapq.heappush(self.heap, (H, self._ver, obj_id))
-
-    def on_hit(self, req: Request):
-        obj_id = req.obj_id
-        rec = self.queue.get(obj_id)
-        if rec is None:
-            return
-        size, freq, _, _ = rec
-        # If size changes (rare), update.
-        size = req.obj_size or size
-        freq = freq + 1
-        self._push(obj_id, size, freq)
-
-    def on_miss(self, req: Request):
-        if req.obj_size > self.cache_size:
-            return
-        self._push(req.obj_id, req.obj_size, 1)
-
-    def evict(self, req: Request):
-        if not self.queue:
-            return 0
-
-        # Pop until we find a live record
-        while self.heap:
-            H, ver, obj_id = self.heap[0]
-            rec = self.queue.get(obj_id)
-            if rec is None:
-                self._heapq.heappop(self.heap)
-                continue
-            _, _, H_current, ver_current = rec
-            if ver != ver_current or H != H_current:
-                self._heapq.heappop(self.heap)
-                continue
-
-            # Found victim
-            self._heapq.heappop(self.heap)
-            self.L = H  # aging
-            self.queue.pop(obj_id, None)
-            return obj_id
-
-        # Fallback (should be rare)
-        obj_id = next(iter(self.queue.keys()))
-        self.queue.pop(obj_id, None)
-        return obj_id
-
-    def on_remove(self, obj_id: int):
-        self.queue.pop(obj_id, None)
-
 class GDSFDecayReinsertCache:
     """
     GDSF with:
@@ -200,222 +122,6 @@ class GDSFDecayReinsertCache:
         return obj_id
 
     def on_remove(self, obj_id: int):
-        self.queue.pop(obj_id, None)
-
-class S3SIEVECache:
-    """
-    S3-SIEVE hybrid:
-      - Probation queue S: FIFO-ish with promotion threshold
-      - Protected/main M: SIEVE (lazy promotion), aiming to preserve hot items without LRU reordering
-
-    Motivation:
-      If hits are frequent, LRU-style reordering can be expensive (and sometimes unnecessary for hit rate);
-      SIEVE keeps hit-path minimal (set a bit) and does most of its work at eviction time.
-
-    This matches common discussions of "plugging SIEVE into S3-FIFO-like architectures."
-    """
-
-    class _Node:
-        __slots__ = ("obj_id", "prev", "next", "size", "cnt", "visited")
-
-        def __init__(self, obj_id: int, size: int, cnt: int = 0, visited: bool = False):
-            self.obj_id = obj_id
-            self.prev = None
-            self.next = None
-            self.size = size
-            self.cnt = cnt
-            self.visited = visited
-
-    class _DLL:
-        __slots__ = ("head", "tail", "bytes", "nodes")
-
-        def __init__(self):
-            self.head = S3SIEVECache._Node(-1, 0)
-            self.tail = S3SIEVECache._Node(-2, 0)
-            self.head.next = self.tail
-            self.tail.prev = self.head
-            self.bytes = 0
-            self.nodes: dict[int, S3SIEVECache._Node] = {}
-
-        def empty(self):
-            return self.head.next is self.tail
-
-        def push_head(self, node: "S3SIEVECache._Node"):
-            node.next = self.head.next
-            node.prev = self.head
-            self.head.next.prev = node
-            self.head.next = node
-            self.nodes[node.obj_id] = node
-            self.bytes += node.size
-
-        def pop_tail(self) -> "S3SIEVECache._Node | None":
-            if self.empty():
-                return None
-            node = self.tail.prev
-            self.remove(node.obj_id)
-            return node
-
-        def remove(self, obj_id: int) -> "S3SIEVECache._Node | None":
-            node = self.nodes.pop(obj_id, None)
-            if node is None:
-                return None
-            node.prev.next = node.next
-            node.next.prev = node.prev
-            self.bytes -= node.size
-            node.prev = node.next = None
-            return node
-
-    def __init__(self, cache_size: int):
-        from collections import deque
-
-        self.cache_size = cache_size
-        self.S = self._DLL()
-
-        # Main SIEVE structure
-        self.M_nodes: dict[int, S3SIEVECache._Node] = {}
-        self.M_head = self._Node(-10, 0)
-        self.M_tail = self._Node(-11, 0)
-        self.M_head.next = self.M_tail
-        self.M_tail.prev = self.M_head
-        self.M_bytes = 0
-        self.M_hand: S3SIEVECache._Node | None = None
-
-        # Ghost
-        self.G_q = deque()
-        self.G_s: set[int] = set()
-        self.G_max = 200_000
-
-        # Params
-        self.small_ratio = 0.10
-        self.small_target = int(self.cache_size * self.small_ratio)
-        self.promote_threshold = 2
-
-        # Boilerplate free_hook target
-        self.queue: dict[int, int] = {}
-
-    def _ghost_add(self, obj_id: int):
-        self.G_s.add(obj_id)
-        self.G_q.append(obj_id)
-        while len(self.G_s) > self.G_max and self.G_q:
-            old = self.G_q.popleft()
-            self.G_s.discard(old)
-
-    # ----- Main SIEVE list operations -----
-    def _M_insert_head(self, node: _Node):
-        node.next = self.M_head.next
-        node.prev = self.M_head
-        self.M_head.next.prev = node
-        self.M_head.next = node
-        self.M_nodes[node.obj_id] = node
-        self.M_bytes += node.size
-        if self.M_hand is None:
-            self.M_hand = self.M_tail.prev if self.M_tail.prev is not self.M_head else None
-
-    def _M_remove_node(self, node: _Node):
-        node.prev.next = node.next
-        node.next.prev = node.prev
-        self.M_bytes -= node.size
-        self.M_nodes.pop(node.obj_id, None)
-        node.prev = node.next = None
-
-    def on_hit(self, req: Request):
-        obj_id = req.obj_id
-        if obj_id in self.S.nodes:
-            node = self.S.nodes[obj_id]
-            node.cnt += 1
-            if node.cnt >= self.promote_threshold:
-                moved = self.S.remove(obj_id)
-                if moved is not None:
-                    moved.visited = True
-                    self._M_insert_head(moved)
-        elif obj_id in self.M_nodes:
-            self.M_nodes[obj_id].visited = True
-
-    def on_miss(self, req: Request):
-        if req.obj_size > self.cache_size:
-            return
-        obj_id = req.obj_id
-        size = req.obj_size
-
-        if obj_id in self.G_s:
-            self.G_s.discard(obj_id)
-            node = self._Node(obj_id, size=size, visited=True)
-            self._M_insert_head(node)
-        else:
-            node = self._Node(obj_id, size=size, cnt=0)
-            self.S.push_head(node)
-
-        self.queue[obj_id] = size
-
-    def _evict_from_M(self) -> int:
-        if not self.M_nodes:
-            return 0
-        if self.M_hand is None:
-            self.M_hand = self.M_tail.prev if self.M_tail.prev is not self.M_head else None
-            if self.M_hand is None:
-                return 0
-
-        node = self.M_hand
-        while True:
-            if node is self.M_head:
-                node = self.M_tail.prev
-                continue
-            if node.visited:
-                node.visited = False
-                node = node.prev
-                continue
-
-            victim = node
-            self.M_hand = victim.prev if victim.prev is not self.M_head else self.M_tail.prev
-            vid = victim.obj_id
-            self._M_remove_node(victim)
-            self.queue.pop(vid, None)
-            if not self.M_nodes:
-                self.M_hand = None
-            return vid
-
-    def evict(self, req: Request):
-        if not self.queue:
-            return 0
-
-        # Prefer evicting from S for quick demotion, unless S is small and M has content.
-        prefer_S = (not self.S.empty()) and (self.S.bytes > self.small_target or not self.M_nodes)
-
-        if prefer_S:
-            while not self.S.empty():
-                cand = self.S.pop_tail()
-                if cand is None:
-                    break
-                if cand.cnt >= self.promote_threshold:
-                    cand.visited = True
-                    self._M_insert_head(cand)
-                    continue
-                vid = cand.obj_id
-                self.queue.pop(vid, None)
-                self._ghost_add(vid)
-                return vid
-
-        # Evict from SIEVE main
-        vid = self._evict_from_M()
-        if vid:
-            return vid
-
-        # Fallback
-        vid = next(iter(self.queue.keys()))
-        self.on_remove(vid)
-        return vid
-
-    def on_remove(self, obj_id: int):
-        if obj_id in self.S.nodes:
-            self.S.remove(obj_id)
-        if obj_id in self.M_nodes:
-            node = self.M_nodes.get(obj_id)
-            if node is not None:
-                if self.M_hand is node:
-                    self.M_hand = node.prev if node.prev is not self.M_head else self.M_tail.prev
-                self._M_remove_node(node)
-                if not self.M_nodes:
-                    self.M_hand = None
         self.queue.pop(obj_id, None)
 
 class SIEVEReinsertCache:
@@ -741,29 +447,20 @@ class ARCCache:
         except ValueError:
             pass
 
-class LIRSCache:
+class LIRSReinsertionCache:
     """
-    Simplified LIRS (Low Inter-reference Recency Set).
+    LIRS with ghost reinsertion and tunable LIR/HIR ratio.
 
-    Key insight: Instead of pure recency (LRU) or frequency (LFU),
-    LIRS tracks the *reuse distance* — how many distinct items were
-    accessed between two consecutive accesses to the same item.
-
-    Items with small reuse distance are "LIR" (hot), others are "HIR" (cold).
-    Only HIR items are eviction candidates. LIR set is bounded.
-
-    This helps when:
-    - Some items have short reuse distances embedded in longer sequences
-    - Scan patterns interleave with hot working sets
-    - ARC/SIEVE fail because they can't distinguish reuse distance from recency
-
-    Simplified implementation:
-    - LIR stack (ordered by recency, tracks reuse distance implicitly)
-    - HIR list (small, FIFO-ish, eviction candidates)
-    - Stack pruning to bound LIR set
+    Enhancements over basic LIRS:
+    - Ghost list: recently evicted HIR items are tracked. On miss,
+      if obj_id is in ghost, promote directly to LIR (skip HIR cold start).
+      This helps workloads where evicted items recur soon.
+    - Tunable lir_ratio: default 0.99 (1% HIR). Lower values (e.g. 0.90)
+      give HIR more room, reducing thrashing when the hot set doesn't
+      partition cleanly into a tiny cold fraction.
     """
 
-    def __init__(self, cache_size: int, lir_ratio: float = 0.99):
+    def __init__(self, cache_size: int, lir_ratio: float = 0.99, ghost_max: int = 100_000):
         self.cache_size = cache_size
         self.lir_size = max(1, int(cache_size * lir_ratio))
         self.hir_size = max(1, cache_size - self.lir_size)
@@ -780,7 +477,18 @@ class LIRSCache:
         self.lir_bytes = 0
         self.hir_bytes = 0
 
+        # Ghost list for evicted HIR items
+        self.ghost_q: deque = deque()
+        self.ghost_s: set[int] = set()
+        self.ghost_max = ghost_max
+
         self.queue: dict[int, int] = {}
+
+    def _ghost_add(self, obj_id: int):
+        self.ghost_s.add(obj_id)
+        self.ghost_q.append(obj_id)
+        while len(self.ghost_s) > self.ghost_max and self.ghost_q:
+            self.ghost_s.discard(self.ghost_q.popleft())
 
     def _stack_prune(self):
         """Remove non-LIR entries from bottom of stack."""
@@ -805,7 +513,6 @@ class LIRSCache:
                     self.hir_bytes += bot_sz
                 self._stack_prune()
                 return
-            # else: non-LIR entry, keep pruning
 
     def on_hit(self, req: Request):
         obj_id = req.obj_id
@@ -844,18 +551,31 @@ class LIRSCache:
         obj_id = req.obj_id
         sz = req.obj_size
 
+        # Check ghost hit first — evicted HIR that returned
+        ghost_hit = obj_id in self.ghost_s
+        if ghost_hit:
+            self.ghost_s.discard(obj_id)
+
         if obj_id in self.stack:
-            # Was non-resident HIR — promote to LIR
+            # Was non-resident HIR in stack — promote to LIR
             self.stack.pop(obj_id)
-            old_info = self.status.get(obj_id)
-            if old_info and old_info[0] == "HIR_NONRES":
-                pass  # expected
             self.status[obj_id] = ("LIR", sz)
             self.lir_bytes += sz
             self.stack[obj_id] = True
 
             while self.lir_bytes > self.lir_size:
                 self._demote_lir_bottom()
+
+        elif ghost_hit:
+            # Ghost hit but not in stack — promote to LIR directly
+            # (This is the ghost reinsertion boost: skip HIR cold start)
+            self.status[obj_id] = ("LIR", sz)
+            self.lir_bytes += sz
+            self.stack[obj_id] = True
+
+            while self.lir_bytes > self.lir_size:
+                self._demote_lir_bottom()
+
         else:
             # Brand new: enter as HIR resident
             self.status[obj_id] = ("HIR_RES", sz)
@@ -880,6 +600,7 @@ class LIRSCache:
                 self.status.pop(vid, None)
 
             self.queue.pop(vid, None)
+            self._ghost_add(vid)
             return vid
 
         # Fallback: evict bottom LIR
@@ -914,7 +635,7 @@ class LIRSCache:
                 self.stack.pop(obj_id, None)
         self.queue.pop(obj_id, None)
 
-        # Bound stack size
+        # Bound stack size to prevent memory blowup from non-resident entries
         while len(self.stack) > max(len(self.queue) * 3, 10000):
             bot_id = next(iter(self.stack))
             self.stack.pop(bot_id)
@@ -924,47 +645,42 @@ class LIRSCache:
 
 class LECARCache:
     """
-    LeCaR: Learning Cache Replacement.
+    LeCaR with improved discount handling.
 
-    Uses regret minimization to dynamically blend LRU and LFU.
-    Maintains:
-      - An LRU eviction policy
-      - An LFU eviction policy (min-heap by frequency)
-      - A weight w in [0,1]: probability of using LRU vs LFU for eviction
-      - Ghost lists for each policy to learn which would have been better
+    Fix: original used cumulative time for discount, causing
+    (1-d)^t -> 0 after a few hundred misses, freezing weights.
+    Now uses time-since-eviction per ghost entry, keeping
+    learning active throughout the trace.
 
-    On ghost hit from LRU's ghost -> LFU was right -> decrease w (favor LFU)
-    On ghost hit from LFU's ghost -> LRU was right -> increase w (favor LRU)
-
-    Different from ARC because:
-    - ARC adapts partition SIZE between recency/frequency lists
-    - LeCaR adapts the PROBABILITY of choosing which policy to evict from
-    - LeCaR uses multiplicative weight update (exponential learning)
+    Also supports swapping LRU for FIFO as one policy arm,
+    useful for scan-heavy workloads where FIFO > LRU.
     """
 
-    def __init__(self, cache_size: int, learning_rate: float = 0.45, discount: float = 0.005):
+    def __init__(self, cache_size: int, learning_rate: float = 0.45,
+                 discount: float = 0.005, use_fifo: bool = False):
         import heapq
         import random
 
         self.cache_size = cache_size
         self.lr = learning_rate
         self.discount = discount
+        self.use_fifo = use_fifo
         self._heapq = heapq
         self._random = random
 
         self.w = 0.5
 
-        # LRU: OrderedDict, LRU at front
-        self.lru_order: OrderedDict[int, int] = OrderedDict()
+        # Recency policy: OrderedDict (LRU or FIFO depending on use_fifo)
+        self.recency_order: OrderedDict[int, int] = OrderedDict()
 
         # LFU: dict + lazy heap
         self.freq: dict[int, int] = {}
         self.heap: list[tuple[int, int, int]] = []
         self._ver = 0
 
-        # Ghost lists
-        self.ghost_lru: OrderedDict[int, None] = OrderedDict()
-        self.ghost_lfu: OrderedDict[int, None] = OrderedDict()
+        # Ghost lists — now store eviction timestamp for proper discount
+        self.ghost_rec: OrderedDict[int, int] = OrderedDict()  # obj_id -> eviction_time
+        self.ghost_freq: OrderedDict[int, int] = OrderedDict()  # obj_id -> eviction_time
         self.ghost_max = 100_000
 
         self.queue: dict[int, int] = {}
@@ -979,8 +695,11 @@ class LECARCache:
         obj_id = req.obj_id
         if obj_id not in self.queue:
             return
-        if obj_id in self.lru_order:
-            self.lru_order.move_to_end(obj_id)
+        self._time += 1
+        # Update recency: move to MRU (LRU mode) or no-op (FIFO mode)
+        if not self.use_fifo and obj_id in self.recency_order:
+            self.recency_order.move_to_end(obj_id)
+        # Update frequency
         self.freq[obj_id] = self.freq.get(obj_id, 0) + 1
         self._lfu_push(obj_id)
 
@@ -991,19 +710,23 @@ class LECARCache:
         sz = req.obj_size
         self._time += 1
 
-        # Learn from ghost hits
-        if obj_id in self.ghost_lru:
-            self.ghost_lru.pop(obj_id)
-            d = math.pow(1 - self.discount, self._time)
+        # Learn from ghost hits using time-since-eviction for discount
+        if obj_id in self.ghost_rec:
+            evict_time = self.ghost_rec.pop(obj_id)
+            age = self._time - evict_time
+            d = math.pow(1 - self.discount, age)
+            # Recency ghost hit -> recency was wrong -> favor frequency
             self.w = max(0.001, self.w * math.exp(-self.lr * d))
 
-        elif obj_id in self.ghost_lfu:
-            self.ghost_lfu.pop(obj_id)
-            d = math.pow(1 - self.discount, self._time)
+        elif obj_id in self.ghost_freq:
+            evict_time = self.ghost_freq.pop(obj_id)
+            age = self._time - evict_time
+            d = math.pow(1 - self.discount, age)
+            # Frequency ghost hit -> frequency was wrong -> favor recency
             self.w = min(0.999, 1.0 - (1.0 - self.w) * math.exp(-self.lr * d))
 
         self.queue[obj_id] = sz
-        self.lru_order[obj_id] = sz
+        self.recency_order[obj_id] = sz
         self.freq[obj_id] = 1
         self._lfu_push(obj_id)
 
@@ -1012,23 +735,23 @@ class LECARCache:
             return 0
 
         if self._random.random() < self.w:
-            vid = self._evict_lru()
+            vid = self._evict_recency()
             if vid is not None:
-                self.ghost_lru[vid] = None
-                if len(self.ghost_lru) > self.ghost_max:
-                    self.ghost_lru.popitem(last=False)
+                self.ghost_rec[vid] = self._time
+                if len(self.ghost_rec) > self.ghost_max:
+                    self.ghost_rec.popitem(last=False)
                 return vid
-            vid = self._evict_lfu()
+            vid = self._evict_freq()
             if vid is not None:
                 return vid
         else:
-            vid = self._evict_lfu()
+            vid = self._evict_freq()
             if vid is not None:
-                self.ghost_lfu[vid] = None
-                if len(self.ghost_lfu) > self.ghost_max:
-                    self.ghost_lfu.popitem(last=False)
+                self.ghost_freq[vid] = self._time
+                if len(self.ghost_freq) > self.ghost_max:
+                    self.ghost_freq.popitem(last=False)
                 return vid
-            vid = self._evict_lru()
+            vid = self._evict_recency()
             if vid is not None:
                 return vid
 
@@ -1036,16 +759,16 @@ class LECARCache:
         self.queue.pop(vid)
         return vid
 
-    def _evict_lru(self):
-        while self.lru_order:
-            vid, vsz = self.lru_order.popitem(last=False)
+    def _evict_recency(self):
+        while self.recency_order:
+            vid, vsz = self.recency_order.popitem(last=False)
             if vid in self.queue:
                 self.queue.pop(vid)
                 self.freq.pop(vid, None)
                 return vid
         return None
 
-    def _evict_lfu(self):
+    def _evict_freq(self):
         while self.heap:
             f, ver, obj_id = self.heap[0]
             if obj_id not in self.queue:
@@ -1057,14 +780,14 @@ class LECARCache:
                 continue
             self._heapq.heappop(self.heap)
             self.queue.pop(obj_id)
-            self.lru_order.pop(obj_id, None)
+            self.recency_order.pop(obj_id, None)
             self.freq.pop(obj_id, None)
             return obj_id
         return None
 
     def on_remove(self, obj_id: int):
         self.queue.pop(obj_id, None)
-        self.lru_order.pop(obj_id, None)
+        self.recency_order.pop(obj_id, None)
         self.freq.pop(obj_id, None)
 
 def init_hook(common_cache_params: CommonCacheParams):
@@ -1077,7 +800,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.6969 (3/7)
     # LIRS 0.6660 (6/7), LECAR 0.7080 (2/7)
     if cs == 7027:
-        return LIRSCache(cs)
+        return LIRSReinsertionCache(cs)
 
     # trace_0, 70273
     # FIFO 0.4932 (0/7), GDSF 0.4714 (2/7), SIEVEReinsert 0.4478 (5/7),
@@ -1122,7 +845,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.4797 (3/7)
     # LIRS 0.3467 (5/7), LECAR 0.5644 (3/7)
     elif cs == 37627:
-        return LIRSCache(cs)
+        return LIRSReinsertionCache(cs)
 
     # trace_3, 728
     # FIFO 0.6747 (0/7), GDSF 0.6549 (1/7), SIEVEReinsert 0.6426 (2/7),
@@ -1140,7 +863,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.1632 (4/7)
     # LIRS 0.1585 (5/7), LECAR 0.5609 (0/7)
     elif cs == 7282:
-        return LIRSCache(cs)
+        return LIRSReinsertionCache(cs)
 
     # trace_4, 4263
     # FIFO 0.4872 (0/7), GDSF 0.4206 (5/7), SIEVEReinsert 0.4255 (5/7),
@@ -1160,7 +883,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.95,3.5,50k) 0.1403 (5/7)
     # LIRS 0.1268 (5/7), LECAR 0.2457 (3/7)
     elif cs == 42632:
-        return LIRSCache(cs)
+        return LIRSReinsertionCache(cs)
 
     # trace_5, 4915
     # FIFO 0.7751 (0/7), GDSF 0.7546 (5/7), SIEVEReinsert 0.7533 (5/7),
@@ -1187,7 +910,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.6359 (2/7)
     # LIRS 0.6256 (5/7), LECAR 0.6372 (1/7)
     elif cs == 7555:
-        return LIRSCache(cs)
+        return LIRSReinsertionCache(cs)
 
     # trace_6, 75551
     # FIFO 0.3707 (2/7), GDSF 0.3973 (1/7), SIEVEReinsert 0.3767 (2/7),
@@ -1206,7 +929,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.95,3.5,50k) 0.251 (5/7)
     # LIRS 0.1656 (5/7), LECAR 0.7861 (1/7)
     elif cs == 1646:
-        return LIRSCache(cs)
+        return LIRSReinsertionCache(cs)
 
     # trace_7, 16460
     # FIFO 0.1153 (0/7), GDSF 0.0996 (2/7), SIEVEReinsert 0.0997 (2/7),
@@ -1215,7 +938,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.0994 (2/7)
     # LIRS 0.0808 (6/7), LECAR 0.1015 (1/7)
     elif cs == 16460:
-        return LIRSCache(cs)
+        return LIRSReinsertionCache(cs)
 
     # trace_8, 3225
     # FIFO 0.7601 (1/7), GDSF 0.7506 (6/7), SIEVEReinsert 0.7526 (4/7),
@@ -1233,7 +956,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.6505 (4/7)
     # LIRS 0.4742 (5/7), LECAR 0.7151 (3/7)
     elif cs == 32254:
-        return LIRSCache(cs)
+        return LIRSReinsertionCache(cs)
 
     # trace_9, 7164
     # FIFO 0.7330 (0/7), GDSF 0.7238 (3/7), SIEVEReinsert 0.7248 (3/7),
@@ -1242,7 +965,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.7205 (4/7)
     # LIRS 0.7100 (6/7), LECAR 0.7278 (1/7)
     elif cs == 7164:
-        return LIRSCache(cs)
+        return LIRSReinsertionCache(cs)
 
     # trace_9, 71647
     # FIFO 0.4827 (0/7), GDSF 0.3687 (6/7), SIEVEReinsert 0.4002 (2/7),
@@ -1251,9 +974,9 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.3741 (6/7)
     # LIRS 0.3805 (5/7), LECAR 0.4496 (2/7)
     elif cs == 71647:
-        return GDSFCache(cs)
+        return GDSFDecayReinsertCache(cs, decay=0.97, ghost_boost=1.5, ghost_max=10_000)
 
-    return GDSFCache(cs)
+    return ARCCache(cs)
 
 def hit_hook(data, req: Request):
     data.on_hit(req)
