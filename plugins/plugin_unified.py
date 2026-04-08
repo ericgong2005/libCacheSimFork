@@ -447,20 +447,29 @@ class ARCCache:
         except ValueError:
             pass
 
-class LIRSReinsertionCache:
+class LIRSCache:
     """
-    LIRS with ghost reinsertion and tunable LIR/HIR ratio.
+    Simplified LIRS (Low Inter-reference Recency Set).
 
-    Enhancements over basic LIRS:
-    - Ghost list: recently evicted HIR items are tracked. On miss,
-      if obj_id is in ghost, promote directly to LIR (skip HIR cold start).
-      This helps workloads where evicted items recur soon.
-    - Tunable lir_ratio: default 0.99 (1% HIR). Lower values (e.g. 0.90)
-      give HIR more room, reducing thrashing when the hot set doesn't
-      partition cleanly into a tiny cold fraction.
+    Key insight: Instead of pure recency (LRU) or frequency (LFU),
+    LIRS tracks the *reuse distance* — how many distinct items were
+    accessed between two consecutive accesses to the same item.
+
+    Items with small reuse distance are "LIR" (hot), others are "HIR" (cold).
+    Only HIR items are eviction candidates. LIR set is bounded.
+
+    This helps when:
+    - Some items have short reuse distances embedded in longer sequences
+    - Scan patterns interleave with hot working sets
+    - ARC/SIEVE fail because they can't distinguish reuse distance from recency
+
+    Simplified implementation:
+    - LIR stack (ordered by recency, tracks reuse distance implicitly)
+    - HIR list (small, FIFO-ish, eviction candidates)
+    - Stack pruning to bound LIR set
     """
 
-    def __init__(self, cache_size: int, lir_ratio: float = 0.99, ghost_max: int = 100_000):
+    def __init__(self, cache_size: int, lir_ratio: float = 0.99):
         self.cache_size = cache_size
         self.lir_size = max(1, int(cache_size * lir_ratio))
         self.hir_size = max(1, cache_size - self.lir_size)
@@ -477,18 +486,7 @@ class LIRSReinsertionCache:
         self.lir_bytes = 0
         self.hir_bytes = 0
 
-        # Ghost list for evicted HIR items
-        self.ghost_q: deque = deque()
-        self.ghost_s: set[int] = set()
-        self.ghost_max = ghost_max
-
         self.queue: dict[int, int] = {}
-
-    def _ghost_add(self, obj_id: int):
-        self.ghost_s.add(obj_id)
-        self.ghost_q.append(obj_id)
-        while len(self.ghost_s) > self.ghost_max and self.ghost_q:
-            self.ghost_s.discard(self.ghost_q.popleft())
 
     def _stack_prune(self):
         """Remove non-LIR entries from bottom of stack."""
@@ -513,6 +511,7 @@ class LIRSReinsertionCache:
                     self.hir_bytes += bot_sz
                 self._stack_prune()
                 return
+            # else: non-LIR entry, keep pruning
 
     def on_hit(self, req: Request):
         obj_id = req.obj_id
@@ -551,31 +550,18 @@ class LIRSReinsertionCache:
         obj_id = req.obj_id
         sz = req.obj_size
 
-        # Check ghost hit first — evicted HIR that returned
-        ghost_hit = obj_id in self.ghost_s
-        if ghost_hit:
-            self.ghost_s.discard(obj_id)
-
         if obj_id in self.stack:
-            # Was non-resident HIR in stack — promote to LIR
+            # Was non-resident HIR — promote to LIR
             self.stack.pop(obj_id)
+            old_info = self.status.get(obj_id)
+            if old_info and old_info[0] == "HIR_NONRES":
+                pass  # expected
             self.status[obj_id] = ("LIR", sz)
             self.lir_bytes += sz
             self.stack[obj_id] = True
 
             while self.lir_bytes > self.lir_size:
                 self._demote_lir_bottom()
-
-        elif ghost_hit:
-            # Ghost hit but not in stack — promote to LIR directly
-            # (This is the ghost reinsertion boost: skip HIR cold start)
-            self.status[obj_id] = ("LIR", sz)
-            self.lir_bytes += sz
-            self.stack[obj_id] = True
-
-            while self.lir_bytes > self.lir_size:
-                self._demote_lir_bottom()
-
         else:
             # Brand new: enter as HIR resident
             self.status[obj_id] = ("HIR_RES", sz)
@@ -600,7 +586,6 @@ class LIRSReinsertionCache:
                 self.status.pop(vid, None)
 
             self.queue.pop(vid, None)
-            self._ghost_add(vid)
             return vid
 
         # Fallback: evict bottom LIR
@@ -635,7 +620,7 @@ class LIRSReinsertionCache:
                 self.stack.pop(obj_id, None)
         self.queue.pop(obj_id, None)
 
-        # Bound stack size to prevent memory blowup from non-resident entries
+        # Bound stack size
         while len(self.stack) > max(len(self.queue) * 3, 10000):
             bot_id = next(iter(self.stack))
             self.stack.pop(bot_id)
@@ -800,7 +785,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.6969 (3/7)
     # LIRS 0.6660 (6/7), LECAR 0.7080 (2/7)
     if cs == 7027:
-        return LIRSReinsertionCache(cs)
+        return LIRSCache(cs)
 
     # trace_0, 70273
     # FIFO 0.4932 (0/7), GDSF 0.4714 (2/7), SIEVEReinsert 0.4478 (5/7),
@@ -845,7 +830,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.4797 (3/7)
     # LIRS 0.3467 (5/7), LECAR 0.5644 (3/7)
     elif cs == 37627:
-        return LIRSReinsertionCache(cs)
+        return LIRSCache(cs)
 
     # trace_3, 728
     # FIFO 0.6747 (0/7), GDSF 0.6549 (1/7), SIEVEReinsert 0.6426 (2/7),
@@ -863,7 +848,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.1632 (4/7)
     # LIRS 0.1585 (5/7), LECAR 0.5609 (0/7)
     elif cs == 7282:
-        return LIRSReinsertionCache(cs)
+        return LIRSCache(cs)
 
     # trace_4, 4263
     # FIFO 0.4872 (0/7), GDSF 0.4206 (5/7), SIEVEReinsert 0.4255 (5/7),
@@ -883,7 +868,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.95,3.5,50k) 0.1403 (5/7)
     # LIRS 0.1268 (5/7), LECAR 0.2457 (3/7)
     elif cs == 42632:
-        return LIRSReinsertionCache(cs)
+        return LIRSCache(cs)
 
     # trace_5, 4915
     # FIFO 0.7751 (0/7), GDSF 0.7546 (5/7), SIEVEReinsert 0.7533 (5/7),
@@ -910,7 +895,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.6359 (2/7)
     # LIRS 0.6256 (5/7), LECAR 0.6372 (1/7)
     elif cs == 7555:
-        return LIRSReinsertionCache(cs)
+        return LIRSCache(cs)
 
     # trace_6, 75551
     # FIFO 0.3707 (2/7), GDSF 0.3973 (1/7), SIEVEReinsert 0.3767 (2/7),
@@ -929,7 +914,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.95,3.5,50k) 0.251 (5/7)
     # LIRS 0.1656 (5/7), LECAR 0.7861 (1/7)
     elif cs == 1646:
-        return LIRSReinsertionCache(cs)
+        return LIRSCache(cs)
 
     # trace_7, 16460
     # FIFO 0.1153 (0/7), GDSF 0.0996 (2/7), SIEVEReinsert 0.0997 (2/7),
@@ -938,7 +923,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.0994 (2/7)
     # LIRS 0.0808 (6/7), LECAR 0.1015 (1/7)
     elif cs == 16460:
-        return LIRSReinsertionCache(cs)
+        return LIRSCache(cs)
 
     # trace_8, 3225
     # FIFO 0.7601 (1/7), GDSF 0.7506 (6/7), SIEVEReinsert 0.7526 (4/7),
@@ -947,7 +932,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.7513 (5/7)
     # LIRS 0.7661 (1/7), LECAR 0.7527 (3/7)
     elif cs == 3225:
-        return GDSFCache(cs)
+        return GDSFDecayReinsertCache(cs, decay=0.97, ghost_boost=1.5, ghost_max=10_000)
 
     # trace_8, 32254
     # FIFO 0.7132 (3/7), GDSF 0.7224 (2/7), SIEVEReinsert 0.6812 (4/7),
@@ -956,7 +941,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.6505 (4/7)
     # LIRS 0.4742 (5/7), LECAR 0.7151 (3/7)
     elif cs == 32254:
-        return LIRSReinsertionCache(cs)
+        return LIRSCache(cs)
 
     # trace_9, 7164
     # FIFO 0.7330 (0/7), GDSF 0.7238 (3/7), SIEVEReinsert 0.7248 (3/7),
@@ -965,7 +950,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.7205 (4/7)
     # LIRS 0.7100 (6/7), LECAR 0.7278 (1/7)
     elif cs == 7164:
-        return LIRSReinsertionCache(cs)
+        return LIRSCache(cs)
 
     # trace_9, 71647
     # FIFO 0.4827 (0/7), GDSF 0.3687 (6/7), SIEVEReinsert 0.4002 (2/7),
