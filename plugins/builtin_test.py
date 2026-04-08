@@ -18,7 +18,7 @@ from libcachesim import (
 )
 
 def init_hook(common_cache_params: CommonCacheParams):
-    return S3FIFO(common_cache_params.cache_size)
+    return LIRS(common_cache_params.cache_size)
 
 def hit_hook(data, req: Request):
     data.get(req)
