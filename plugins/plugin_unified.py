@@ -122,17 +122,17 @@ class S3FIFOTunedCache:
         __slots__ = ("head", "tail", "bytes", "nodes")
 
         def __init__(self):
-            self.head = FifoCache._Node(-1, 0)
-            self.tail = FifoCache._Node(-2, 0)
+            self.head = S3FIFOTunedCache._Node(-1, 0)
+            self.tail = S3FIFOTunedCache._Node(-2, 0)
             self.head.next = self.tail
             self.tail.prev = self.head
             self.bytes = 0
-            self.nodes: dict[int, FifoCache._Node] = {}
+            self.nodes: dict[int, S3FIFOTunedCache._Node] = {}
 
         def empty(self) -> bool:
             return self.head.next is self.tail
 
-        def push_head(self, node: "FifoCache._Node"):
+        def push_head(self, node: "S3FIFOTunedCache._Node"):
             node.next = self.head.next
             node.prev = self.head
             self.head.next.prev = node
@@ -140,14 +140,14 @@ class S3FIFOTunedCache:
             self.nodes[node.obj_id] = node
             self.bytes += node.size
 
-        def pop_tail(self) -> "FifoCache._Node | None":
+        def pop_tail(self) -> "S3FIFOTunedCache._Node | None":
             if self.empty():
                 return None
             node = self.tail.prev
             self.remove(node.obj_id)
             return node
 
-        def remove(self, obj_id: int) -> "FifoCache._Node | None":
+        def remove(self, obj_id: int) -> "S3FIFOTunedCache._Node | None":
             node = self.nodes.pop(obj_id, None)
             if node is None:
                 return None
@@ -277,14 +277,14 @@ class SIEVEKCache:
 
     def __init__(self, cache_size: int):
         self.cache_size = cache_size
-        self.queue: dict[int, FifoCache._Node] = {}
+        self.queue: dict[int, SIEVEKCache._Node] = {}
 
         self._head = self._Node(-1)
         self._tail = self._Node(-2)
         self._head.next = self._tail
         self._tail.prev = self._head
 
-        self._hand: FifoCache._Node | None = None
+        self._hand: SIEVEKCache._Node | None = None
 
         self._k = 2  # tune: 1 => SIEVE, 2/3 => stronger protection
 
