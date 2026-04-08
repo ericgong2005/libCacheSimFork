@@ -128,8 +128,8 @@ class GDSFDecayReinsertCache:
 def init_hook(common_cache_params: CommonCacheParams):
     cs = common_cache_params.cache_size
 
-    return GDSFDecayReinsertCache(cs, decay=0.90, ghost_boost=2.0, ghost_max=150_000)
-    # return GDSFDecayReinsertCache(cs, decay=0.90, ghost_boost=3.0, ghost_max=50_000)
+    # return GDSFDecayReinsertCache(cs, decay=0.90, ghost_boost=2.0, ghost_max=150_000)
+    return GDSFDecayReinsertCache(cs, decay=0.90, ghost_boost=3.0, ghost_max=50_000)
 
 
 
