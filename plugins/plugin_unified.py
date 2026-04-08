@@ -424,29 +424,6 @@ class ARCCache:
         self.queue.pop(obj_id, None)
         # Do not remove from ghosts (ghosts represent recent evictions)
 
-
-    def __init__(self, cache_size: int):
-        self.queue = deque()
-        self.cache_size = cache_size
-
-    def on_hit(self, req: Request):
-        pass  # FIFO does not reorder on hit
-
-    def on_miss(self, req: Request):
-        if req.obj_size <= self.cache_size:
-            self.queue.append(req.obj_id)
-
-    def evict(self, req: Request):
-        if not self.queue:
-            return 0
-        return self.queue.popleft()
-
-    def on_remove(self, obj_id: int):
-        try:
-            self.queue.remove(obj_id)
-        except ValueError:
-            pass
-
 class LIRSCache:
     """
     Simplified LIRS (Low Inter-reference Recency Set).
