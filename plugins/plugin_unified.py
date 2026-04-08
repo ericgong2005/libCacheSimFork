@@ -607,102 +607,107 @@ class LIRSCache:
 
 class LECARCache:
     """
-    LeCaR with improved discount handling.
+    Deterministic, size-aware LeCaR.
 
-    Fix: original used cumulative time for discount, causing
-    (1-d)^t -> 0 after a few hundred misses, freezing weights.
-    Now uses time-since-eviction per ghost entry, keeping
-    learning active throughout the trace.
-
-    Also supports swapping LRU for FIFO as one policy arm,
-    useful for scan-heavy workloads where FIFO > LRU.
+    Changes from naive LeCaR:
+    1. Deterministic: credit-based scheduling replaces random coin flip.
+       Accumulate w per eviction; when credit >= 1, use recency arm, else
+       frequency arm.  Gives exactly the right proportion without randomness.
+    2. Size-aware LFU: heap keyed on freq/size instead of freq, so large
+       infrequent objects are evicted before small frequent ones.
+    3. FIFO mode: optionally skip move-to-end on hit for the recency arm,
+       useful for scan-heavy traces where FIFO > LRU.
+    4. Stable learning: per-ghost-entry age-based discount with clamped
+       minimum to prevent learning from freezing.
     """
 
-    def __init__(self, cache_size: int, learning_rate: float = 0.45,
-                 discount: float = 0.005, use_fifo: bool = False):
+    def __init__(self, cache_size, learning_rate=0.45,
+                 discount=0.005, use_fifo=False):
         import heapq
-        import random
-
         self.cache_size = cache_size
         self.lr = learning_rate
         self.discount = discount
         self.use_fifo = use_fifo
         self._heapq = heapq
-        self._random = random
 
         self.w = 0.5
+        self._credit = 0.0
 
-        # Recency policy: OrderedDict (LRU or FIFO depending on use_fifo)
-        self.recency_order: OrderedDict[int, int] = OrderedDict()
+        # Recency arm: OrderedDict, LRU at front
+        self.recency_order = OrderedDict()  # obj_id -> size
 
-        # LFU: dict + lazy heap
-        self.freq: dict[int, int] = {}
-        self.heap: list[tuple[int, int, int]] = []
+        # Frequency arm: size-aware min-heap
+        self.freq = {}  # obj_id -> hit_count
+        self.sizes = {}  # obj_id -> size
+        self.heap = []  # (freq/size, ver, obj_id)
         self._ver = 0
 
-        # Ghost lists — now store eviction timestamp for proper discount
-        self.ghost_rec: OrderedDict[int, int] = OrderedDict()  # obj_id -> eviction_time
-        self.ghost_freq: OrderedDict[int, int] = OrderedDict()  # obj_id -> eviction_time
+        # Ghost lists with eviction timestamps
+        self.ghost_rec = OrderedDict()  # obj_id -> eviction_time
+        self.ghost_freq = OrderedDict()
         self.ghost_max = 100_000
 
-        self.queue: dict[int, int] = {}
+        self.queue = {}  # obj_id -> size
         self._time = 0
 
-    def _lfu_push(self, obj_id: int):
+    def _lfu_push(self, obj_id):
         f = self.freq.get(obj_id, 0)
+        sz = max(self.sizes.get(obj_id, 1), 1)
         self._ver += 1
-        self._heapq.heappush(self.heap, (f, self._ver, obj_id))
+        self._heapq.heappush(self.heap, (f / sz, self._ver, obj_id))
 
-    def on_hit(self, req: Request):
+    def on_hit(self, req):
         obj_id = req.obj_id
         if obj_id not in self.queue:
             return
         self._time += 1
-        # Update recency: move to MRU (LRU mode) or no-op (FIFO mode)
         if not self.use_fifo and obj_id in self.recency_order:
             self.recency_order.move_to_end(obj_id)
-        # Update frequency
         self.freq[obj_id] = self.freq.get(obj_id, 0) + 1
         self._lfu_push(obj_id)
 
-    def on_miss(self, req: Request):
+    def on_miss(self, req):
         if req.obj_size > self.cache_size:
             return
         obj_id = req.obj_id
         sz = req.obj_size
         self._time += 1
 
-        # Learn from ghost hits using time-since-eviction for discount
+        # Learn from ghost hits
         if obj_id in self.ghost_rec:
             evict_time = self.ghost_rec.pop(obj_id)
-            age = self._time - evict_time
-            d = math.pow(1 - self.discount, age)
-            # Recency ghost hit -> recency was wrong -> favor frequency
+            age = max(self._time - evict_time, 1)
+            d = max(math.pow(1 - self.discount, age), 0.01)
+            # Recency evicted this but it came back → favor frequency
             self.w = max(0.001, self.w * math.exp(-self.lr * d))
-
         elif obj_id in self.ghost_freq:
             evict_time = self.ghost_freq.pop(obj_id)
-            age = self._time - evict_time
-            d = math.pow(1 - self.discount, age)
-            # Frequency ghost hit -> frequency was wrong -> favor recency
+            age = max(self._time - evict_time, 1)
+            d = max(math.pow(1 - self.discount, age), 0.01)
+            # Frequency evicted this but it came back → favor recency
             self.w = min(0.999, 1.0 - (1.0 - self.w) * math.exp(-self.lr * d))
 
         self.queue[obj_id] = sz
         self.recency_order[obj_id] = sz
         self.freq[obj_id] = 1
+        self.sizes[obj_id] = sz
         self._lfu_push(obj_id)
 
-    def evict(self, req: Request):
+    def evict(self, req):
         if not self.queue:
             return 0
 
-        if self._random.random() < self.w:
+        # Deterministic credit-based policy selection
+        self._credit += self.w
+        if self._credit >= 1.0:
+            self._credit -= 1.0
             vid = self._evict_recency()
             if vid is not None:
                 self.ghost_rec[vid] = self._time
                 if len(self.ghost_rec) > self.ghost_max:
                     self.ghost_rec.popitem(last=False)
                 return vid
+            # Fallback to other arm
             vid = self._evict_freq()
             if vid is not None:
                 return vid
@@ -713,6 +718,7 @@ class LECARCache:
                 if len(self.ghost_freq) > self.ghost_max:
                     self.ghost_freq.popitem(last=False)
                 return vid
+            # Fallback to other arm
             vid = self._evict_recency()
             if vid is not None:
                 return vid
@@ -727,480 +733,35 @@ class LECARCache:
             if vid in self.queue:
                 self.queue.pop(vid)
                 self.freq.pop(vid, None)
+                self.sizes.pop(vid, None)
                 return vid
         return None
 
     def _evict_freq(self):
         while self.heap:
-            f, ver, obj_id = self.heap[0]
+            score, ver, obj_id = self.heap[0]
             if obj_id not in self.queue:
                 self._heapq.heappop(self.heap)
                 continue
             cur_f = self.freq.get(obj_id, 0)
-            if cur_f != f:
+            cur_sz = max(self.sizes.get(obj_id, 1), 1)
+            cur_score = cur_f / cur_sz
+            if abs(cur_score - score) > 1e-9:
                 self._heapq.heappop(self.heap)
                 continue
             self._heapq.heappop(self.heap)
             self.queue.pop(obj_id)
             self.recency_order.pop(obj_id, None)
             self.freq.pop(obj_id, None)
+            self.sizes.pop(obj_id, None)
             return obj_id
         return None
 
-    def on_remove(self, obj_id: int):
+    def on_remove(self, obj_id):
         self.queue.pop(obj_id, None)
         self.recency_order.pop(obj_id, None)
         self.freq.pop(obj_id, None)
-
-class LECARByteAwareCache:
-    """
-    Deterministic, byte-aware LeCaR-style cache for variable-size objects.
-
-    Design goals:
-      - No randomness at all.
-      - Byte-aware frequency protection.
-      - Recency expert that can prefer either LRU-like or FIFO-like victims
-        based on observed ghost feedback.
-      - Heuristic deterministic victim selection from candidate objects.
-      - Conservative admission for large first-seen objects to reduce scan pollution.
-
-    Core idea:
-      Maintain two learned balances:
-
-        w_rf   : recency-vs-frequency preference
-        w_lru  : LRU-vs-FIFO preference inside the recency expert
-
-      But unlike stochastic LeCaR, these weights are used only as deterministic
-      blend coefficients in candidate scoring.
-
-    Objects tracked:
-      - queue[obj_id] = size
-      - recency_order: insertion/access order for LRU/FIFO candidate generation
-      - freq[obj_id] = hit count
-      - heap stores lazy-updated LFU-by-size priorities
-
-    Ghosts:
-      - ghost_rec[obj_id]  = (evict_time, size, evict_freq, rec_kind)
-            rec_kind in {"lru", "fifo"}
-      - ghost_freq[obj_id] = (evict_time, size, evict_freq)
-
-      On a ghost hit:
-        * ghost_rec  => recency expert made a mistake, shift toward frequency
-        * ghost_freq => frequency expert made a mistake, shift toward recency
-
-        If ghost_rec contains rec_kind:
-          * "lru"  => shift recency subweight away from LRU toward FIFO
-          * "fifo" => shift recency subweight away from FIFO toward LRU
-
-    Deterministic eviction:
-      1. Produce three candidates:
-           - LRU victim
-           - FIFO victim
-           - FREQ victim (lowest freq/size utility)
-      2. Score each candidate with a blended "badness" heuristic.
-      3. Evict the candidate with the highest badness.
-
-    Important note:
-      This is not canonical LeCaR anymore; it is a deterministic adaptation
-      for byte-sized caches and mixed IO traces.
-    """
-
-    def __init__(
-        self,
-        cache_size: int,
-        learning_rate: float = 0.45,
-        discount: float = 0.005,
-        ghost_max: int = 100_000,
-        admit_large_frac: float = 0.01,
-        initial_w_rf: float = 0.50,
-        initial_w_lru: float = 0.50,
-        bypass_large_first_seen: bool = True,
-    ):
-        import heapq
-
-        self.cache_size = cache_size
-        self.lr = learning_rate
-        self.discount = discount
-        self.ghost_max = ghost_max
-        self.admit_large_frac = admit_large_frac
-        self.bypass_large_first_seen = bypass_large_first_seen
-
-        self._heapq = heapq
-
-        # Learned balances
-        self.w_rf = float(min(0.999, max(0.001, initial_w_rf)))   # recency vs frequency
-        self.w_lru = float(min(0.999, max(0.001, initial_w_lru))) # LRU vs FIFO
-
-        # Resident objects
-        self.queue: dict[int, int] = {}         # obj_id -> size
-        self.freq: dict[int, int] = {}          # obj_id -> count
-        self.size: dict[int, int] = {}          # obj_id -> size
-        self.last_access: dict[int, int] = {}   # obj_id -> logical time of last touch
-        self.insert_time: dict[int, int] = {}   # obj_id -> logical time of admission
-
-        # Recency ordering:
-        # insertion order retained for FIFO semantics
-        # move_to_end on hit for LRU semantics
-        self.recency_order: OrderedDict[int, int] = OrderedDict()
-
-        # Lazy min-heap for low utility (freq/size) candidates
-        # (utility, version, obj_id)
-        self.heap: list[tuple[float, int, int]] = []
-        self._ver = 0
-        self._obj_ver: dict[int, int] = {}
-
-        # Ghost metadata
-        # ghost_rec[obj_id]  = (evict_time, size, evict_freq, rec_kind)
-        # ghost_freq[obj_id] = (evict_time, size, evict_freq)
-        self.ghost_rec: OrderedDict[int, tuple[int, int, int, str]] = OrderedDict()
-        self.ghost_freq: OrderedDict[int, tuple[int, int, int]] = OrderedDict()
-
-        self._time = 0
-
-    # ----------------------------
-    # Internal helpers
-    # ----------------------------
-
-    def _touch_time(self):
-        self._time += 1
-        return self._time
-
-    def _min_size(self, sz: int) -> int:
-        return max(int(sz), 1)
-
-    def _utility(self, obj_id: int) -> float:
-        """
-        Frequency utility per byte.
-        Higher utility => should be kept.
-        Lower utility => better eviction candidate for frequency expert.
-        """
-        f = self.freq.get(obj_id, 0)
-        sz = self._min_size(self.size.get(obj_id, 1))
-        return f / sz
-
-    def _push_freq_candidate(self, obj_id: int):
-        self._ver += 1
-        self._obj_ver[obj_id] = self._ver
-        u = self._utility(obj_id)
-        self._heapq.heappush(self.heap, (u, self._ver, obj_id))
-
-    def _prune_ghosts(self):
-        while len(self.ghost_rec) > self.ghost_max:
-            self.ghost_rec.popitem(last=False)
-        while len(self.ghost_freq) > self.ghost_max:
-            self.ghost_freq.popitem(last=False)
-
-    def _ghost_penalty(self, evict_time: int, obj_size: int) -> float:
-        """
-        Cost-weighted, age-discounted learning signal.
-
-        Larger objects matter more.
-        Faster re-reference matters more.
-        """
-        age = max(1, self._time - evict_time)
-        # Exponential decay by age; bounded away from 0 by finite precision
-        d = math.pow(max(1e-9, 1.0 - self.discount), age)
-
-        size_factor = min(1.0, max(obj_size, 1) / max(self.cache_size, 1))
-        # Keep penalty meaningful even for small objects
-        size_factor = max(size_factor, 0.05)
-
-        return d * size_factor
-
-    def _update_w_rf_toward_frequency(self, penalty: float):
-        # Recency was wrong -> reduce recency preference
-        self.w_rf = max(0.001, self.w_rf * math.exp(-self.lr * penalty))
-
-    def _update_w_rf_toward_recency(self, penalty: float):
-        # Frequency was wrong -> increase recency preference
-        self.w_rf = min(0.999, 1.0 - (1.0 - self.w_rf) * math.exp(-self.lr * penalty))
-
-    def _update_w_lru_toward_fifo(self, penalty: float):
-        # LRU specifically was wrong
-        self.w_lru = max(0.001, self.w_lru * math.exp(-self.lr * penalty))
-
-    def _update_w_lru_toward_lru(self, penalty: float):
-        # FIFO specifically was wrong
-        self.w_lru = min(0.999, 1.0 - (1.0 - self.w_lru) * math.exp(-self.lr * penalty))
-
-    def _is_ghost_hit(self, obj_id: int) -> bool:
-        return obj_id in self.ghost_rec or obj_id in self.ghost_freq
-
-    def _should_admit(self, obj_id: int, sz: int) -> bool:
-        """
-        Deterministic admission control:
-          - always admit ghost hits
-          - always admit small objects
-          - optionally bypass large first-seen objects
-        """
-        if obj_id in self.ghost_rec or obj_id in self.ghost_freq:
-            return True
-
-        threshold = max(1, int(self.cache_size * self.admit_large_frac))
-        is_small = sz <= threshold
-
-        if is_small:
-            return True
-
-        if not self.bypass_large_first_seen:
-            return True
-
-        return False
-
-    def _candidate_lru(self):
-        """
-        LRU victim: oldest by access order.
-        recency_order is access order because hits move_to_end().
-        """
-        for obj_id in self.recency_order.keys():
-            if obj_id in self.queue:
-                return obj_id
-        return None
-
-    def _candidate_fifo(self):
-        """
-        FIFO victim: oldest by insertion time.
-        Since recency_order is mutated for LRU, use explicit insert_time.
-        """
-        best_id = None
-        best_insert = None
-        for obj_id in self.queue.keys():
-            t = self.insert_time.get(obj_id, 0)
-            if best_insert is None or t < best_insert:
-                best_insert = t
-                best_id = obj_id
-        return best_id
-
-    def _candidate_freq(self):
-        """
-        Lowest utility (freq/size) victim.
-        Lazy heap with versions.
-        """
-        while self.heap:
-            u, ver, obj_id = self.heap[0]
-            if obj_id not in self.queue:
-                self._heapq.heappop(self.heap)
-                continue
-            if self._obj_ver.get(obj_id) != ver:
-                self._heapq.heappop(self.heap)
-                continue
-            cur_u = self._utility(obj_id)
-            if abs(cur_u - u) > 1e-15:
-                self._heapq.heappop(self.heap)
-                continue
-            return obj_id
-        return None
-
-    def _norm_recency_age(self, obj_id: int) -> float:
-        """
-        0..1 where larger means colder by access recency.
-        """
-        last = self.last_access.get(obj_id, self.insert_time.get(obj_id, self._time))
-        age = max(0, self._time - last)
-        denom = max(len(self.queue), 1)
-        return min(1.0, age / denom)
-
-    def _norm_fifo_age(self, obj_id: int) -> float:
-        """
-        0..1 where larger means older by insertion age.
-        """
-        ins = self.insert_time.get(obj_id, self._time)
-        age = max(0, self._time - ins)
-        denom = max(len(self.queue), 1)
-        return min(1.0, age / denom)
-
-    def _norm_low_utility(self, obj_id: int) -> float:
-        """
-        0..1 where larger means worse utility and more evictable.
-        """
-        # Map utility = f/size into an inverse badness.
-        # Utility can be very small, so use u/(1+u) squashing then invert.
-        u = self._utility(obj_id)
-        keepiness = u / (1.0 + u)
-        return 1.0 - keepiness
-
-    def _norm_size_pressure(self, obj_id: int) -> float:
-        """
-        0..1 where larger means object is expensive in bytes.
-        """
-        sz = max(self.size.get(obj_id, 1), 1)
-        return min(1.0, sz / max(self.cache_size, 1))
-
-    def _score_candidate(self, obj_id: int, source: str) -> float:
-        """
-        Deterministic blended badness score.
-        Higher score => evict.
-
-        Intuition:
-          - Recency side:
-              * uses a blend of LRU-coldness and FIFO-oldness
-          - Frequency side:
-              * uses low utility = low (freq/size)
-          - Size pressure always contributes somewhat
-          - Candidate source gets a slight boost from the expert that nominated it
-        """
-        rec_bad = self.w_lru * self._norm_recency_age(obj_id) + (1.0 - self.w_lru) * self._norm_fifo_age(obj_id)
-        freq_bad = self._norm_low_utility(obj_id)
-        size_bad = self._norm_size_pressure(obj_id)
-
-        blended = self.w_rf * rec_bad + (1.0 - self.w_rf) * freq_bad
-
-        # Slight source-aware tie-breaking:
-        # the expert that nominated the object gets a modest confidence bump.
-        if source == "lru":
-            source_bonus = 0.05 * self.w_rf * self.w_lru
-        elif source == "fifo":
-            source_bonus = 0.05 * self.w_rf * (1.0 - self.w_lru)
-        else:  # "freq"
-            source_bonus = 0.05 * (1.0 - self.w_rf)
-
-        # Large objects are a bit more attractive to evict when all else is close.
-        return blended + 0.10 * size_bad + source_bonus
-
-    def _remove_resident(self, obj_id: int):
-        self.queue.pop(obj_id, None)
-        self.freq.pop(obj_id, None)
-        self.size.pop(obj_id, None)
-        self.last_access.pop(obj_id, None)
-        self.insert_time.pop(obj_id, None)
-        self.recency_order.pop(obj_id, None)
-        self._obj_ver.pop(obj_id, None)
-
-    def _record_recency_ghost(self, obj_id: int, rec_kind: str):
-        meta = (
-            self._time,
-            self.size.get(obj_id, 1),
-            self.freq.get(obj_id, 1),
-            rec_kind,
-        )
-        self.ghost_rec[obj_id] = meta
-        self.ghost_rec.move_to_end(obj_id)
-        self._prune_ghosts()
-
-    def _record_freq_ghost(self, obj_id: int):
-        meta = (
-            self._time,
-            self.size.get(obj_id, 1),
-            self.freq.get(obj_id, 1),
-        )
-        self.ghost_freq[obj_id] = meta
-        self.ghost_freq.move_to_end(obj_id)
-        self._prune_ghosts()
-
-    # ----------------------------
-    # Public simulator hooks
-    # ----------------------------
-
-    def on_hit(self, req):
-        obj_id = req.obj_id
-        if obj_id not in self.queue:
-            return
-
-        now = self._touch_time()
-
-        self.freq[obj_id] = self.freq.get(obj_id, 0) + 1
-        self.last_access[obj_id] = now
-
-        if obj_id in self.recency_order:
-            self.recency_order.move_to_end(obj_id)
-
-        self._push_freq_candidate(obj_id)
-
-    def on_miss(self, req):
-        sz = req.obj_size
-        if sz > self.cache_size:
-            return
-
-        obj_id = req.obj_id
-        now = self._touch_time()
-
-        # Learning from ghost hits
-        if obj_id in self.ghost_rec:
-            evict_time, ghost_sz, ghost_freq, rec_kind = self.ghost_rec.pop(obj_id)
-            penalty = self._ghost_penalty(evict_time, ghost_sz)
-
-            # Recency expert was wrong -> favor frequency more
-            self._update_w_rf_toward_frequency(penalty)
-
-            # Learn inside recency expert
-            if rec_kind == "lru":
-                self._update_w_lru_toward_fifo(penalty)
-            elif rec_kind == "fifo":
-                self._update_w_lru_toward_lru(penalty)
-
-        elif obj_id in self.ghost_freq:
-            evict_time, ghost_sz, ghost_freq = self.ghost_freq.pop(obj_id)
-            penalty = self._ghost_penalty(evict_time, ghost_sz)
-
-            # Frequency expert was wrong -> favor recency more
-            self._update_w_rf_toward_recency(penalty)
-
-        # Admission control
-        if not self._should_admit(obj_id, sz):
-            return
-
-        self.queue[obj_id] = sz
-        self.size[obj_id] = sz
-        self.freq[obj_id] = 1
-        self.insert_time[obj_id] = now
-        self.last_access[obj_id] = now
-        self.recency_order[obj_id] = sz
-        self._push_freq_candidate(obj_id)
-
-    def evict(self, req):
-        if not self.queue:
-            return 0
-
-        c_lru = self._candidate_lru()
-        c_fifo = self._candidate_fifo()
-        c_freq = self._candidate_freq()
-
-        candidates = []
-        seen = set()
-
-        if c_lru is not None and c_lru not in seen:
-            candidates.append((c_lru, "lru"))
-            seen.add(c_lru)
-        if c_fifo is not None and c_fifo not in seen:
-            candidates.append((c_fifo, "fifo"))
-            seen.add(c_fifo)
-        if c_freq is not None and c_freq not in seen:
-            candidates.append((c_freq, "freq"))
-            seen.add(c_freq)
-
-        if not candidates:
-            vid = next(iter(self.queue))
-            self._remove_resident(vid)
-            return vid
-
-        best_id = None
-        best_source = None
-        best_score = None
-
-        for obj_id, source in candidates:
-            score = self._score_candidate(obj_id, source)
-            if best_score is None or score > best_score:
-                best_score = score
-                best_id = obj_id
-                best_source = source
-
-        if best_id is None:
-            best_id = next(iter(self.queue))
-            best_source = "freq"
-
-        # Record ghost before removing resident metadata
-        if best_source == "freq":
-            self._record_freq_ghost(best_id)
-        elif best_source == "lru":
-            self._record_recency_ghost(best_id, "lru")
-        else:
-            self._record_recency_ghost(best_id, "fifo")
-
-        self._remove_resident(best_id)
-        return best_id
-
-    def on_remove(self, obj_id: int):
-        self._remove_resident(obj_id)
+        self.sizes.pop(obj_id, None)
 
 def init_hook(common_cache_params: CommonCacheParams):
     cs = common_cache_params.cache_size
@@ -1331,7 +892,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     # GDSFDecayReinsert(0.9,3.0,50k) 0.4000 (1/7)
     # LIRS 0.4105 (0/7), LECAR 0.3645 (3/7)
     elif cs == 75551:
-        return LECARByteAwareCache(cs)
+        return LECARCache(cs)
 
     # trace_7, 1646
     # FIFO 0.7812 (1/7), GDSF 0.3683 (4/7), SIEVEReinsert 0.5609 (2/7),
@@ -1388,7 +949,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     elif cs == 71647:
         return GDSFDecayReinsertCache(cs, decay=0.97, ghost_boost=1.5, ghost_max=10_000)
 
-    return ARCCache(cs)
+    return LECARCache(cs)
 
 def hit_hook(data, req: Request):
     data.on_hit(req)
