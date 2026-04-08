@@ -906,6 +906,8 @@ def init_hook(common_cache_params: CommonCacheParams):
     elif cs == 71647:
         return GDSFCache(cs)
 
+    return FifoCache(cs)
+
 
 def hit_hook(data, req: Request):
     data.on_hit(req)
