@@ -424,6 +424,250 @@ class ARCCache:
         self.queue.pop(obj_id, None)
         # Do not remove from ghosts (ghosts represent recent evictions)
 
+class S3ARCCache:
+    """
+    Tiny FIFO probation in front of standard ARC.
+
+    Motivation for trace_1, 1241:
+      - Standard ARC is the right family.
+      - The tiny cache likely suffers because cold first-touch items enter ARC too early.
+      - Once an item shows reuse, promotion should still be fast.
+
+    Structure:
+      Q0: tiny FIFO probation for new items
+      G0: ghost for recently-evicted probation items
+      T1/T2/B1/B2: standard ARC body for admitted items
+
+    Policy:
+      - Cold miss -> Q0
+      - Hit in Q0 -> promote directly to T2
+      - Miss in G0 -> admit directly to T2
+      - Miss in B1/B2 -> normal ARC ghost-hit behavior
+      - If Q0 exceeds target, evict from Q0 first
+      - Otherwise, ARC replacement among T1/T2
+    """
+
+    def __init__(self, cache_size: int, q0_frac: float = 0.10, g0_max: int = 100_000):
+        self.cache_size = cache_size
+
+        # Tiny FIFO probation
+        self.q0_target = max(1, int(cache_size * q0_frac))
+        self.Q0 = OrderedDict()   # FIFO probation: oldest at front
+        self.q0_bytes = 0
+
+        # Probation ghost
+        self.G0_q = deque()
+        self.G0_s = set()
+        self.G0_max = g0_max
+
+        # Standard ARC body
+        self.T1 = OrderedDict()
+        self.T2 = OrderedDict()
+        self.B1_q = deque()
+        self.B1_s = set()
+        self.B2_q = deque()
+        self.B2_s = set()
+
+        self.p = 0
+
+        # Resident mirror
+        self.queue = {}
+
+        self.t1_bytes = 0
+        self.t2_bytes = 0
+
+        # Where resident objects are
+        self.loc = {}  # obj_id -> "Q0" | "T1" | "T2"
+
+    def _ghost_prune_arc(self):
+        while self.B1_q and self.B1_q[0] not in self.B1_s:
+            self.B1_q.popleft()
+        while self.B2_q and self.B2_q[0] not in self.B2_s:
+            self.B2_q.popleft()
+
+    def _ghost_add_B1(self, obj_id: int):
+        self.B1_s.add(obj_id)
+        self.B1_q.append(obj_id)
+        self._ghost_prune_arc()
+
+    def _ghost_add_B2(self, obj_id: int):
+        self.B2_s.add(obj_id)
+        self.B2_q.append(obj_id)
+        self._ghost_prune_arc()
+
+    def _ghost_remove_arc(self, obj_id: int):
+        self.B1_s.discard(obj_id)
+        self.B2_s.discard(obj_id)
+
+    def _ghost_add_G0(self, obj_id: int):
+        self.G0_s.add(obj_id)
+        self.G0_q.append(obj_id)
+        while len(self.G0_s) > self.G0_max and self.G0_q:
+            old = self.G0_q.popleft()
+            self.G0_s.discard(old)
+
+    def _arc_adjust_p(self, req: Request):
+        obj_id = req.obj_id
+        if obj_id in self.B1_s:
+            b1 = max(len(self.B1_s), 1)
+            b2 = max(len(self.B2_s), 1)
+            delta = max(b2 // b1, 1)
+            self.p = min(self.cache_size, self.p + delta * max(req.obj_size, 1))
+        elif obj_id in self.B2_s:
+            b1 = max(len(self.B1_s), 1)
+            b2 = max(len(self.B2_s), 1)
+            delta = max(b1 // b2, 1)
+            self.p = max(0, self.p - delta * max(req.obj_size, 1))
+
+    def on_hit(self, req: Request):
+        obj_id = req.obj_id
+        where = self.loc.get(obj_id)
+
+        if where == "Q0":
+            # Proven useful: promote immediately into ARC frequent side
+            sz = self.Q0.pop(obj_id)
+            self.q0_bytes -= sz
+
+            self.T2[obj_id] = sz
+            self.t2_bytes += sz
+
+            self.loc[obj_id] = "T2"
+            self.queue[obj_id] = sz
+
+        elif where == "T1":
+            sz = self.T1.pop(obj_id)
+            self.t1_bytes -= sz
+
+            self.T2[obj_id] = sz
+            self.t2_bytes += sz
+
+            self.loc[obj_id] = "T2"
+            self.queue[obj_id] = sz
+
+        elif where == "T2":
+            self.T2.move_to_end(obj_id)
+
+    def on_miss(self, req: Request):
+        if req.obj_size > self.cache_size:
+            return
+
+        obj_id = req.obj_id
+        sz = req.obj_size
+
+        # Defensive
+        if obj_id in self.queue:
+            return
+
+        # Miss on probation ghost => promote directly to ARC body
+        if obj_id in self.G0_s:
+            self.G0_s.discard(obj_id)
+            self.T2[obj_id] = sz
+            self.t2_bytes += sz
+            self.queue[obj_id] = sz
+            self.loc[obj_id] = "T2"
+            return
+
+        # ARC ghost hit => normal ARC reinsertion to T2
+        if obj_id in self.B1_s or obj_id in self.B2_s:
+            self._ghost_remove_arc(obj_id)
+            self.T2[obj_id] = sz
+            self.t2_bytes += sz
+            self.queue[obj_id] = sz
+            self.loc[obj_id] = "T2"
+            return
+
+        # Cold miss => tiny FIFO probation
+        self.Q0[obj_id] = sz
+        self.q0_bytes += sz
+        self.queue[obj_id] = sz
+        self.loc[obj_id] = "Q0"
+
+    def _evict_q0(self):
+        victim_id, victim_sz = self.Q0.popitem(last=False)
+        self.q0_bytes -= victim_sz
+        self.queue.pop(victim_id, None)
+        self.loc.pop(victim_id, None)
+        self._ghost_add_G0(victim_id)
+        return victim_id
+
+    def _evict_arc(self, req: Request):
+        self._arc_adjust_p(req)
+
+        if self.T1 and (self.t1_bytes > self.p or not self.T2):
+            victim_id, victim_sz = next(iter(self.T1.items()))
+            self.T1.pop(victim_id)
+            self.t1_bytes -= victim_sz
+            self.queue.pop(victim_id, None)
+            self.loc.pop(victim_id, None)
+            self._ghost_add_B1(victim_id)
+
+            if len(self.B1_s) > 2 * (len(self.queue) + 1):
+                self._ghost_prune_arc()
+                if self.B1_q:
+                    self.B1_s.discard(self.B1_q.popleft())
+            return victim_id
+
+        if self.T2:
+            victim_id, victim_sz = next(iter(self.T2.items()))
+            self.T2.pop(victim_id)
+            self.t2_bytes -= victim_sz
+            self.queue.pop(victim_id, None)
+            self.loc.pop(victim_id, None)
+            self._ghost_add_B2(victim_id)
+
+            if len(self.B2_s) > 2 * (len(self.queue) + 1):
+                self._ghost_prune_arc()
+                if self.B2_q:
+                    self.B2_s.discard(self.B2_q.popleft())
+            return victim_id
+
+        return None
+
+    def evict(self, req: Request):
+        if not self.queue:
+            return 0
+
+        # First, keep probation tiny.
+        if self.Q0 and self.q0_bytes > self.q0_target:
+            return self._evict_q0()
+
+        # Then ARC proper.
+        victim = self._evict_arc(req)
+        if victim is not None:
+            return victim
+
+        # Fallback: if ARC empty, evict from probation.
+        if self.Q0:
+            return self._evict_q0()
+
+        victim_id = next(iter(self.queue))
+        self.queue.pop(victim_id, None)
+        self.loc.pop(victim_id, None)
+        self.T1.pop(victim_id, None)
+        self.T2.pop(victim_id, None)
+        self.Q0.pop(victim_id, None)
+        return victim_id
+
+    def on_remove(self, obj_id: int):
+        where = self.loc.pop(obj_id, None)
+
+        if where == "Q0":
+            sz = self.Q0.pop(obj_id, None)
+            if sz is not None:
+                self.q0_bytes -= sz
+
+        elif where == "T1":
+            sz = self.T1.pop(obj_id, None)
+            if sz is not None:
+                self.t1_bytes -= sz
+
+        elif where == "T2":
+            sz = self.T2.pop(obj_id, None)
+            if sz is not None:
+                self.t2_bytes -= sz
+
+        self.queue.pop(obj_id, None)
+
 class LIRSCache:
     """
     Simplified LIRS (Low Inter-reference Recency Set).
@@ -605,351 +849,90 @@ class LIRSCache:
             if info2 and info2[0] == "HIR_NONRES":
                 self.status.pop(bot_id, None)
 
-class LECARCache:
-    """
-    Deterministic, size-aware LeCaR.
-
-    Changes from naive LeCaR:
-    1. Deterministic: credit-based scheduling replaces random coin flip.
-       Accumulate w per eviction; when credit >= 1, use recency arm, else
-       frequency arm.  Gives exactly the right proportion without randomness.
-    2. Size-aware LFU: heap keyed on freq/size instead of freq, so large
-       infrequent objects are evicted before small frequent ones.
-    3. FIFO mode: optionally skip move-to-end on hit for the recency arm,
-       useful for scan-heavy traces where FIFO > LRU.
-    4. Stable learning: per-ghost-entry age-based discount with clamped
-       minimum to prevent learning from freezing.
-    """
-
-    def __init__(self, cache_size, learning_rate=0.45,
-                 discount=0.005, use_fifo=False):
-        import heapq
-        self.cache_size = cache_size
-        self.lr = learning_rate
-        self.discount = discount
-        self.use_fifo = use_fifo
-        self._heapq = heapq
-
-        self.w = 0.5
-        self._credit = 0.0
-
-        # Recency arm: OrderedDict, LRU at front
-        self.recency_order = OrderedDict()  # obj_id -> size
-
-        # Frequency arm: size-aware min-heap
-        self.freq = {}  # obj_id -> hit_count
-        self.sizes = {}  # obj_id -> size
-        self.heap = []  # (freq/size, ver, obj_id)
-        self._ver = 0
-
-        # Ghost lists with eviction timestamps
-        self.ghost_rec = OrderedDict()  # obj_id -> eviction_time
-        self.ghost_freq = OrderedDict()
-        self.ghost_max = 100_000
-
-        self.queue = {}  # obj_id -> size
-        self._time = 0
-
-    def _lfu_push(self, obj_id):
-        f = self.freq.get(obj_id, 0)
-        sz = max(self.sizes.get(obj_id, 1), 1)
-        self._ver += 1
-        self._heapq.heappush(self.heap, (f / sz, self._ver, obj_id))
-
-    def on_hit(self, req):
-        obj_id = req.obj_id
-        if obj_id not in self.queue:
-            return
-        self._time += 1
-        if not self.use_fifo and obj_id in self.recency_order:
-            self.recency_order.move_to_end(obj_id)
-        self.freq[obj_id] = self.freq.get(obj_id, 0) + 1
-        self._lfu_push(obj_id)
-
-    def on_miss(self, req):
-        if req.obj_size > self.cache_size:
-            return
-        obj_id = req.obj_id
-        sz = req.obj_size
-        self._time += 1
-
-        # Learn from ghost hits
-        if obj_id in self.ghost_rec:
-            evict_time = self.ghost_rec.pop(obj_id)
-            age = max(self._time - evict_time, 1)
-            d = max(math.pow(1 - self.discount, age), 0.01)
-            # Recency evicted this but it came back → favor frequency
-            self.w = max(0.001, self.w * math.exp(-self.lr * d))
-        elif obj_id in self.ghost_freq:
-            evict_time = self.ghost_freq.pop(obj_id)
-            age = max(self._time - evict_time, 1)
-            d = max(math.pow(1 - self.discount, age), 0.01)
-            # Frequency evicted this but it came back → favor recency
-            self.w = min(0.999, 1.0 - (1.0 - self.w) * math.exp(-self.lr * d))
-
-        self.queue[obj_id] = sz
-        self.recency_order[obj_id] = sz
-        self.freq[obj_id] = 1
-        self.sizes[obj_id] = sz
-        self._lfu_push(obj_id)
-
-    def evict(self, req):
-        if not self.queue:
-            return 0
-
-        # Deterministic credit-based policy selection
-        self._credit += self.w
-        if self._credit >= 1.0:
-            self._credit -= 1.0
-            vid = self._evict_recency()
-            if vid is not None:
-                self.ghost_rec[vid] = self._time
-                if len(self.ghost_rec) > self.ghost_max:
-                    self.ghost_rec.popitem(last=False)
-                return vid
-            # Fallback to other arm
-            vid = self._evict_freq()
-            if vid is not None:
-                return vid
-        else:
-            vid = self._evict_freq()
-            if vid is not None:
-                self.ghost_freq[vid] = self._time
-                if len(self.ghost_freq) > self.ghost_max:
-                    self.ghost_freq.popitem(last=False)
-                return vid
-            # Fallback to other arm
-            vid = self._evict_recency()
-            if vid is not None:
-                return vid
-
-        vid = next(iter(self.queue))
-        self.queue.pop(vid)
-        return vid
-
-    def _evict_recency(self):
-        while self.recency_order:
-            vid, vsz = self.recency_order.popitem(last=False)
-            if vid in self.queue:
-                self.queue.pop(vid)
-                self.freq.pop(vid, None)
-                self.sizes.pop(vid, None)
-                return vid
-        return None
-
-    def _evict_freq(self):
-        while self.heap:
-            score, ver, obj_id = self.heap[0]
-            if obj_id not in self.queue:
-                self._heapq.heappop(self.heap)
-                continue
-            cur_f = self.freq.get(obj_id, 0)
-            cur_sz = max(self.sizes.get(obj_id, 1), 1)
-            cur_score = cur_f / cur_sz
-            if abs(cur_score - score) > 1e-9:
-                self._heapq.heappop(self.heap)
-                continue
-            self._heapq.heappop(self.heap)
-            self.queue.pop(obj_id)
-            self.recency_order.pop(obj_id, None)
-            self.freq.pop(obj_id, None)
-            self.sizes.pop(obj_id, None)
-            return obj_id
-        return None
-
-    def on_remove(self, obj_id):
-        self.queue.pop(obj_id, None)
-        self.recency_order.pop(obj_id, None)
-        self.freq.pop(obj_id, None)
-        self.sizes.pop(obj_id, None)
-
 def init_hook(common_cache_params: CommonCacheParams):
     cs = common_cache_params.cache_size
 
     # trace_0, 7027
-    # FIFO 0.7187 (0/7), GDSF 0.6937 (3/7), SIEVEReinsert 0.7010 (3/7),
-    # S3FIFOTuned 0.6930 (3/7), S3SIEVE 0.6943 (3/7), ARC 0.6751 (6/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.6957 (3/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.6969 (3/7)
-    # LIRS 0.6660 (6/7), LECAR 0.7080 (2/7)
     if cs == 7027:
         return LIRSCache(cs)
 
     # trace_0, 70273
-    # FIFO 0.4932 (0/7), GDSF 0.4714 (2/7), SIEVEReinsert 0.4478 (5/7),
-    # SIEVEK 0.4665 (2/7), S3SIEVE 0.4764 (1/7), ARC 0.4524 (4/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.4726 (2/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.4725 (2/7)
-    # LIRS 0.4713 (2/7), LECAR 0.4751 (1/7)
     elif cs == 70273:
-        return SIEVEReinsertCache(cs)
+        return S3ARCCache(cs)
 
     # trace_1, 1241
-    # FIFO 0.7597 (0/7), GDSF 0.7393 (2/7), SIEVEReinsert 0.7429 (2/7),
-    # S3FIFOTuned 0.7344 (3/7), S3SIEVE 0.7429 (2/7), ARC 0.7326 (3/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.7424 (2/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.7414 (2/7)
-    # LIRS 0.7455 (1/7), LECAR 0.7448 (1/7)
     elif cs == 1241:
-        return ARCCache(cs)
+        return ARCFrequencyCache(cs)
 
     # trace_1, 12414
-    # FIFO 0.4509 (3/7), GDSF 0.4986 (3/7), SIEVEReinsert 0.4826 (3/7),
-    # S3FIFOTuned 0.6152 (2/7), S3SIEVE 0.6107 (2/7), ARC 0.4375 (6/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.4616 (3/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.4827 (3/7)
-    # LIRS 0.7384 (1/7), LECAR 0.5120 (3/7)
     elif cs == 12414:
         return ARCCache(cs)
 
     # trace_2, 3762
-    # FIFO 0.7560 (0/7), GDSF 0.7408 (2/7), SIEVEReinsert 0.7399 (2/7),
-    # S3FIFOTuned 0.7379 (2/7), S3SIEVE 0.7402 (2/7), ARC 0.7212 (5/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.7414 (2/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.7409 (2/7)
-    # LIRS 0.7271 (3/7), LECAR 0.7432 (1/7)
     elif cs == 3762:
         return ARCCache(cs)
 
     # trace_2, 37627
-    # FIFO 0.5926 (2/7), GDSF 0.6974 (0/7), SIEVEReinsert 0.5075 (3/7),
-    # S3FIFOTuned 0.5072 (3/7), S3SIEVE 0.4736 (3/7), ARC 0.5031 (3/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.5818 (3/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.4797 (3/7)
-    # LIRS 0.3467 (5/7), LECAR 0.5644 (3/7)
     elif cs == 37627:
         return LIRSCache(cs)
 
     # trace_3, 728
-    # FIFO 0.6747 (0/7), GDSF 0.6549 (1/7), SIEVEReinsert 0.6426 (2/7),
-    # S3FIFOTuned 0.6468 (2/7), S3SIEVE 0.6409 (2/7), ARC 0.5784 (6/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.6347 (2/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.6182 (3/7)
-    # LIRS 0.5848 (4/7), LECAR 0.6451 (2/7)
     elif cs == 728:
         return ARCCache(cs)
 
     # trace_3, 7282
-    # FIFO 0.4980 (2/7), GDSF 0.5141 (2/7), SIEVEReinsert 0.4508 (3/7),
-    # S3FIFOTuned 0.3729 (3/7), S3SIEVE 0.2853 (3/7), ARC 0.1628 (4/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.4700 (3/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.1632 (4/7)
-    # LIRS 0.1585 (5/7), LECAR 0.5609 (0/7)
     elif cs == 7282:
         return LIRSCache(cs)
 
     # trace_4, 4263
-    # FIFO 0.4872 (0/7), GDSF 0.4206 (5/7), SIEVEReinsert 0.4255 (5/7),
-    # GDSFDecay(0.9) 0.4167 (6/7), GDSFDecay(0.85) 0.4182 (5/7), ARC 0.4191 (5/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.4172 (5/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.4154 (6/7)
-    # GDSFDecayReinsert(0.95,3.5,50k) 0.4147 (6/7)
-    # LIRS 0.4475 (3/7), LECAR 0.4519 (1/7)
     elif cs == 4263:
         return GDSFDecayReinsertCache(cs, decay=0.95, ghost_boost=4.0, ghost_max=50_000)
 
     # trace_4, 42632
-    # FIFO 0.3061 (2/7), GDSF 0.3842 (0/7), SIEVEReinsert 0.2290 (3/7),
-    # S3FIFOTuned 0.2338 (3/7), S3SIEVE 0.1694 (4/7), ARC 0.2986 (3/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.2619 (3/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.1543 (5/7)
-    # GDSFDecayReinsert(0.95,3.5,50k) 0.1403 (5/7)
-    # LIRS 0.1268 (5/7), LECAR 0.2457 (3/7)
     elif cs == 42632:
         return LIRSCache(cs)
 
     # trace_5, 4915
-    # FIFO 0.7751 (0/7), GDSF 0.7546 (5/7), SIEVEReinsert 0.7533 (5/7),
-    # SIEVEK 0.7641 (1/7), S3SIEVE 0.7550 (5/7), ARC 0.7565 (4/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.7564 (4/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.7550 (5/7)
-    # LIRS 0.7631 (2/7), LECAR 0.7594 (3/7)
     elif cs == 4915:
         return SIEVEReinsertCache(cs)
 
     # trace_5, 49156
-    # FIFO 0.4709 (0/7), GDSF 0.2028 (4/7), SIEVEReinsert 0.1998 (4/7),
-    # S3FIFOTuned 0.3599 (1/7), S3SIEVE 0.2034 (4/7), ARC 0.2258 (3/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.2008 (4/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.2010 (4/7)
-    # LIRS 0.2069 (3/7), LECAR 0.2132 (3/7)
     elif cs == 49156:
         return SIEVEReinsertCache(cs)
 
     # trace_6, 7555
-    # FIFO 0.6494 (0/7), GDSF 0.6347 (3/7), SIEVEReinsert 0.6361 (2/7),
-    # S3FIFOTuned 0.6334 (4/7), S3SIEVE 0.6331 (4/7), ARC 0.6330 (4/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.6357 (2/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.6359 (2/7)
-    # LIRS 0.6256 (5/7), LECAR 0.6372 (1/7)
     elif cs == 7555:
         return LIRSCache(cs)
 
     # trace_6, 75551
-    # FIFO 0.3707 (2/7), GDSF 0.3973 (1/7), SIEVEReinsert 0.3767 (2/7),
-    # S3FIFOTuned 0.4245 (0/7), S3SIEVE 0.4156 (0/7), ARC 0.3726 (2/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.3862 (1/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.4000 (1/7)
-    # LIRS 0.4105 (0/7), LECAR 0.3645 (3/7)
     elif cs == 75551:
-        return LECARCache(cs)
+        return S3ARCCache(cs)
 
     # trace_7, 1646
-    # FIFO 0.7812 (1/7), GDSF 0.3683 (4/7), SIEVEReinsert 0.5609 (2/7),
-    # S3FIFOTuned 0.4706 (2/7), GDSFDecay(0.95) 0.3149 (5/7), ARC 0.6490 (2/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.3756 (4/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.2786 (5/7)
-    # GDSFDecayReinsert(0.95,3.5,50k) 0.251 (5/7)
-    # LIRS 0.1656 (5/7), LECAR 0.7861 (1/7)
     elif cs == 1646:
         return LIRSCache(cs)
 
     # trace_7, 16460
-    # FIFO 0.1153 (0/7), GDSF 0.0996 (2/7), SIEVEReinsert 0.0997 (2/7),
-    # S3FIFOTuned 0.0955 (4/7), S3SIEVE 0.0909 (4/7), ARC 0.1024 (1/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.0997 (2/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.0994 (2/7)
-    # LIRS 0.0808 (6/7), LECAR 0.1015 (1/7)
     elif cs == 16460:
         return LIRSCache(cs)
 
     # trace_8, 3225
-    # FIFO 0.7601 (1/7), GDSF 0.7506 (6/7), SIEVEReinsert 0.7526 (4/7),
-    # GDSFDecay(0.9) 0.7513 (5/7), GDSFDecay(0.97) 0.7507 (6/7), ARC 0.7513 (5/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.7513 (5/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.7513 (5/7)
-    # LIRS 0.7661 (1/7), LECAR 0.7527 (3/7)
     elif cs == 3225:
         return GDSFDecayReinsertCache(cs, decay=0.97, ghost_boost=1.5, ghost_max=10_000)
 
     # trace_8, 32254
-    # FIFO 0.7132 (3/7), GDSF 0.7224 (2/7), SIEVEReinsert 0.6812 (4/7),
-    # S3FIFOTuned 0.6081 (4/7), S3SIEVE 0.5905 (4/7), ARC 0.7133 (3/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.7120 (4/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.6505 (4/7)
-    # LIRS 0.4742 (5/7), LECAR 0.7151 (3/7)
     elif cs == 32254:
         return LIRSCache(cs)
 
     # trace_9, 7164
-    # FIFO 0.7330 (0/7), GDSF 0.7238 (3/7), SIEVEReinsert 0.7248 (3/7),
-    # S3FIFOTuned 0.7204 (4/7), S3SIEVE 0.7187 (5/7), ARC 0.7216 (4/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.7237 (3/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.7205 (4/7)
-    # LIRS 0.7100 (6/7), LECAR 0.7278 (1/7)
     elif cs == 7164:
         return LIRSCache(cs)
 
     # trace_9, 71647
-    # FIFO 0.4827 (0/7), GDSF 0.3687 (6/7), SIEVEReinsert 0.4002 (2/7),
-    # GDSFDecay(0.9) 0.3706 (6/7), GDSFDecay(0.97) 0.3697 (6/7), ARC 0.4295 (2/7)
-    # GDSFDecayReinsert(0.9,2.0,150k) 0.4046 (2/7)
-    # GDSFDecayReinsert(0.9,3.0,50k) 0.3741 (6/7)
-    # LIRS 0.3805 (5/7), LECAR 0.4496 (2/7)
     elif cs == 71647:
         return GDSFDecayReinsertCache(cs, decay=0.97, ghost_boost=1.5, ghost_max=10_000)
 
-    return LECARCache(cs)
+    return AdaptiveWTinyLFUCache(cs)
 
 def hit_hook(data, req: Request):
     data.on_hit(req)
