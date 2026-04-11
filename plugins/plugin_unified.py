@@ -1,6 +1,5 @@
 from collections import deque, OrderedDict
 from libcachesim import CommonCacheParams, Request
-import math
 
 class GDSFDecayReinsertCache:
     """
