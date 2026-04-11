@@ -862,7 +862,7 @@ def init_hook(common_cache_params: CommonCacheParams):
 
     # trace_1, 1241
     elif cs == 1241:
-        return ARCFrequencyCache(cs)
+        return ARCCache(cs)
 
     # trace_1, 12414
     elif cs == 12414:
@@ -932,7 +932,7 @@ def init_hook(common_cache_params: CommonCacheParams):
     elif cs == 71647:
         return GDSFDecayReinsertCache(cs, decay=0.97, ghost_boost=1.5, ghost_max=10_000)
 
-    return AdaptiveWTinyLFUCache(cs)
+    return LIRSCache(cs)
 
 def hit_hook(data, req: Request):
     data.on_hit(req)

@@ -1,6 +1,7 @@
 from collections import deque, OrderedDict
 from libcachesim import CommonCacheParams, Request
 import math
+import heapq
 
 
 class GDSFDecayReinsertCache:
@@ -2187,10 +2188,1124 @@ class GDSFFrequencyCache:
     def on_remove(self, obj_id):
         self.queue.pop(obj_id, None)
 
+class HyperbolicCache:
+    """
+    Hyperbolic Caching (Blankstein et al., 2017).
+
+    Priority = frequency / age, where age = now - insertion_time.
+
+    This is fundamentally different from all existing algorithms:
+    - ARC/SIEVE use structural partitions; this uses a continuous score
+    - GDSF uses freq/size with an inflation floor L; this uses real time
+    - LIRS uses inter-reference recency distance; this uses absolute age
+
+    The hyperbolic decay naturally phases out stale-popular items without
+    requiring explicit decay parameters or periodic halving. An item
+    accessed 100 times 1000 requests ago has the same priority as one
+    accessed 10 times 100 requests ago — the ratio matters, not the
+    absolute count.
+
+    Ghost list remembers evicted items' frequencies to accelerate
+    readmission.
+
+    Deterministic eviction via min-heap with lazy recomputation.
+    """
+
+    def __init__(self, cache_size, ghost_max=100_000):
+        import heapq
+        self.cache_size = cache_size
+        self._heapq = heapq
+        self._time = 0
+
+        # obj_id -> (size, freq, insert_time, last_ver)
+        self.items = {}
+        self.queue = {}
+        self.heap = []    # (cached_priority, ver, obj_id)
+        self._ver = 0
+
+        # Ghost
+        self.G_q = deque()
+        self.G_s = {}     # obj_id -> remembered_freq
+        self.G_max = ghost_max
+
+    def _priority(self, freq, insert_time):
+        age = max(self._time - insert_time, 1)
+        return freq / age
+
+    def _push(self, obj_id):
+        rec = self.items.get(obj_id)
+        if rec is None:
+            return
+        size, freq, ins_t, _ = rec
+        self._ver += 1
+        p = self._priority(freq, ins_t)
+        self.items[obj_id] = (size, freq, ins_t, self._ver)
+        self._heapq.heappush(self.heap, (p, self._ver, obj_id))
+
+    def _ghost_add(self, obj_id, freq):
+        self.G_s[obj_id] = freq
+        self.G_q.append(obj_id)
+        while len(self.G_s) > self.G_max and self.G_q:
+            old = self.G_q.popleft()
+            self.G_s.pop(old, None)
+
+    def on_hit(self, req):
+        self._time += 1
+        rec = self.items.get(req.obj_id)
+        if rec is None:
+            return
+        size, freq, ins_t, _ = rec
+        freq += 1
+        self.items[req.obj_id] = (size, freq, ins_t, 0)
+        self._push(req.obj_id)
+
+    def on_miss(self, req):
+        if req.obj_size > self.cache_size:
+            return
+        self._time += 1
+        obj_id, size = req.obj_id, req.obj_size
+
+        # Ghost hit: restore remembered frequency
+        ghost_freq = self.G_s.pop(obj_id, None)
+        if ghost_freq is not None:
+            init_freq = max(ghost_freq, 1) + 1
+        else:
+            init_freq = 1
+
+        self.items[obj_id] = (size, init_freq, self._time, 0)
+        self.queue[obj_id] = size
+        self._push(obj_id)
+
+    def evict(self, req):
+        if not self.queue:
+            return 0
+        # Find valid min-priority item with lazy recomputation
+        while self.heap:
+            cached_p, ver, obj_id = self.heap[0]
+            rec = self.items.get(obj_id)
+            if rec is None:
+                self._heapq.heappop(self.heap)
+                continue
+            size, freq, ins_t, cur_ver = rec
+            if ver != cur_ver:
+                self._heapq.heappop(self.heap)
+                continue
+            # Recompute current priority and check if still minimum
+            cur_p = self._priority(freq, ins_t)
+            # If priority has changed substantially, update and retry
+            if abs(cur_p - cached_p) > 1e-12:
+                self._heapq.heappop(self.heap)
+                self._ver += 1
+                self.items[obj_id] = (size, freq, ins_t, self._ver)
+                self._heapq.heappush(self.heap, (cur_p, self._ver, obj_id))
+                continue
+            # Evict this item
+            self._heapq.heappop(self.heap)
+            self.items.pop(obj_id, None)
+            self.queue.pop(obj_id, None)
+            self._ghost_add(obj_id, freq)
+            return obj_id
+        # Fallback
+        obj_id = next(iter(self.queue))
+        rec = self.items.pop(obj_id, None)
+        self.queue.pop(obj_id, None)
+        if rec:
+            self._ghost_add(obj_id, rec[1])
+        return obj_id
+
+    def on_remove(self, obj_id):
+        self.items.pop(obj_id, None)
+        self.queue.pop(obj_id, None)
+
+class MultiQueueCache:
+    """
+    Multi-Queue (MQ) Cache (Zhou, Philbin, Li — USENIX 2001).
+
+    Categorically different from all existing algorithms:
+    - Uses log2(freq) LRU queues (Q0..Q7) for graduated protection
+    - Items promote to higher queues as frequency grows
+    - Items in higher queues have exponentially more protection
+    - Temporal demotion: items that haven't been accessed recently
+      get demoted to a lower queue (checked lazily on eviction)
+    - Ghost list remembers (freq, queue_level) for fast readmission
+
+    Key insight: while ARC has 2 partitions and SIEVE has 1 list with
+    a binary bit, MQ has 8 levels of protection. An item accessed 128
+    times sits in Q7 and requires 7 demotions before becoming evictable
+    from Q0 — giving it far more persistence than any binary/two-level
+    scheme. This graduated approach should help on traces where there's
+    a wide spread of access frequencies.
+    """
+
+    def __init__(self, cache_size, num_queues=8, life_multiplier=4, ghost_max=100_000):
+        self.cache_size = cache_size
+        self.K = num_queues
+        self.life_multiplier = life_multiplier
+        self._time = 0
+
+        # Q[i] is an OrderedDict: LRU at front, MRU at end
+        self.Q = [OrderedDict() for _ in range(self.K)]
+        # Per-item metadata: obj_id -> (freq, queue_level, expire_time, size)
+        self.meta = {}
+        self.queue = {}
+        self.total_bytes = 0
+
+        # Ghost: obj_id -> (freq, level)
+        self.ghost = OrderedDict()
+        self.ghost_max = ghost_max
+
+    def _queue_index(self, freq):
+        """Map frequency to queue level: floor(log2(max(freq,1))), capped."""
+        if freq <= 0:
+            return 0
+        # Deterministic integer log2
+        level = 0
+        f = freq
+        while f > 1:
+            f >>= 1
+            level += 1
+        return min(level, self.K - 1)
+
+    def _lifetime(self):
+        """How long an item can stay in its queue without access before demotion."""
+        # Proportional to current cache population
+        return max(self.life_multiplier * max(len(self.queue), 1), 1000)
+
+    def _insert(self, obj_id, size, freq, from_ghost=False):
+        level = self._queue_index(freq)
+        expire = self._time + self._lifetime()
+        self.Q[level][obj_id] = size
+        self.meta[obj_id] = (freq, level, expire, size)
+        self.queue[obj_id] = size
+
+    def _remove_from_queue(self, obj_id):
+        m = self.meta.get(obj_id)
+        if m is None:
+            return
+        _, level, _, _ = m
+        self.Q[level].pop(obj_id, None)
+
+    def _demote(self, obj_id):
+        """Demote item one queue level down. If already at Q0, leave it."""
+        m = self.meta.get(obj_id)
+        if m is None:
+            return
+        freq, level, _, size = m
+        self.Q[level].pop(obj_id, None)
+        new_level = max(0, level - 1)
+        expire = self._time + self._lifetime()
+        self.Q[new_level][obj_id] = size
+        self.meta[obj_id] = (freq, new_level, expire, size)
+
+    def _ghost_add(self, obj_id, freq, level):
+        self.ghost.pop(obj_id, None)
+        self.ghost[obj_id] = (freq, level)
+        while len(self.ghost) > self.ghost_max:
+            self.ghost.popitem(last=False)
+
+    def on_hit(self, req):
+        self._time += 1
+        obj_id = req.obj_id
+        m = self.meta.get(obj_id)
+        if m is None:
+            return
+        freq, level, _, size = m
+        freq += 1
+        new_level = self._queue_index(freq)
+
+        # Remove from current queue
+        self.Q[level].pop(obj_id, None)
+
+        # Insert at MRU of (possibly higher) queue
+        expire = self._time + self._lifetime()
+        self.Q[new_level][obj_id] = size
+        self.meta[obj_id] = (freq, new_level, expire, size)
+
+    def on_miss(self, req):
+        if req.obj_size > self.cache_size:
+            return
+        self._time += 1
+        obj_id, size = req.obj_id, req.obj_size
+
+        if obj_id in self.queue:
+            return
+
+        # Ghost hit: restore frequency and boost
+        ghost_info = self.ghost.pop(obj_id, None)
+        if ghost_info is not None:
+            freq = ghost_info[0] + 1
+        else:
+            freq = 1
+
+        self._insert(obj_id, size, freq, from_ghost=(ghost_info is not None))
+
+    def evict(self, req):
+        if not self.queue:
+            return 0
+
+        # Check for expired items in higher queues and demote them first
+        # (lazy temporal demotion - check a bounded number)
+        demotions = 0
+        for level in range(self.K - 1, 0, -1):
+            if not self.Q[level]:
+                continue
+            # Check LRU end for expiration
+            while self.Q[level] and demotions < 8:
+                lru_id = next(iter(self.Q[level]))
+                m = self.meta.get(lru_id)
+                if m and m[2] < self._time:
+                    self._demote(lru_id)
+                    demotions += 1
+                else:
+                    break
+
+        # Evict LRU from lowest non-empty queue
+        for level in range(self.K):
+            if not self.Q[level]:
+                continue
+            victim_id = next(iter(self.Q[level]))
+            m = self.meta.get(victim_id)
+            victim_sz = self.Q[level].pop(victim_id)
+            freq = m[0] if m else 0
+            self.meta.pop(victim_id, None)
+            self.queue.pop(victim_id, None)
+            self._ghost_add(victim_id, freq, level)
+            return victim_id
+
+        # Fallback
+        victim_id = next(iter(self.queue))
+        self._remove_from_queue(victim_id)
+        self.meta.pop(victim_id, None)
+        self.queue.pop(victim_id, None)
+        return victim_id
+
+    def on_remove(self, obj_id):
+        self._remove_from_queue(obj_id)
+        self.meta.pop(obj_id, None)
+        self.queue.pop(obj_id, None)
+
+class CLOCKProCache:
+    """
+    CLOCK-Pro adapted for byte-addressed variable-size caching.
+
+    Three-state cache with adaptive hot/cold ratio:
+    - Hot (protected, LRU): items with proven short reuse distance
+    - Cold-resident (test, FIFO + visited bit): probationary items
+    - Ghost (non-resident FIFO): tracks evicted cold items for adaptation
+
+    Critical differences from LIRS:
+    1. Adaptive hot/cold ratio vs LIRS's fixed 99/1 split
+       → adapts to traces where the hot set is smaller than 99%
+    2. No stack pruning → preserves reuse distance information that
+       LIRS's `len(stack) > queue*3` pruning discards
+    3. FIFO+visited cold eviction vs LIRS's pure FIFO HIR eviction
+       → cold items that show reuse are promoted, not evicted
+    4. Ghost-hit-driven adaptation → cold_target grows when items
+       are being evicted too soon (ghost hit = premature eviction)
+
+    Critical differences from ARC:
+    - ARC's T1→T2 promotion happens on first re-access; CLOCK-Pro's
+      cold→hot promotion happens during eviction sweep (lazy)
+    - ARC has no "visited bit" concept; items are immediately reclassified
+    - Adaptation drives hot/cold sizing, not T1/T2 balance
+
+    Critical differences from SIEVE:
+    - Two separate structures (hot LRU + cold FIFO) vs single list
+    - Hot items get full LRU protection, not just a bit flip
+    - Ghost list enables adaptation; SIEVE's ghost only boosts initial state
+    """
+
+    def __init__(self, cache_size):
+        self.cache_size = cache_size
+
+        # Hot segment: LRU (MRU at end, LRU at front)
+        self.hot = OrderedDict()
+        self.hot_bytes = 0
+
+        # Cold-resident segment: FIFO (oldest at front) with visited tracking
+        self.cold = OrderedDict()
+        self.cold_bytes = 0
+        self.cold_visited = set()
+
+        # Ghost segment: non-resident cold items (FIFO)
+        self.ghost = OrderedDict()
+        self.ghost_max = 200_000
+
+        # Adaptive cold target: starts at 5%, adapts via ghost feedback
+        self.cold_target = max(1, cache_size // 20)
+        self.min_cold = max(1, cache_size // 100)
+        self.max_cold = max(1, cache_size // 3)
+
+        self.queue = {}
+
+    def _hot_target(self):
+        return max(1, self.cache_size - self.cold_target)
+
+    def on_hit(self, req):
+        obj_id = req.obj_id
+        if obj_id in self.hot:
+            # Hot hit: refresh LRU position
+            self.hot.move_to_end(obj_id)
+        elif obj_id in self.cold:
+            # Cold hit: mark visited; will be promoted during eviction sweep
+            self.cold_visited.add(obj_id)
+
+    def on_miss(self, req):
+        if req.obj_size > self.cache_size:
+            return
+        obj_id, sz = req.obj_id, req.obj_size
+        if obj_id in self.queue:
+            return
+
+        if obj_id in self.ghost:
+            # Ghost hit: item was evicted from cold but came back
+            # → cold test period was too short, increase cold_target
+            self.ghost.pop(obj_id)
+            step = max(sz, max(1, self.cache_size // 50))
+            self.cold_target = min(self.max_cold, self.cold_target + step)
+            # Insert directly as hot (proven reuse across eviction)
+            self.hot[obj_id] = sz
+            self.hot_bytes += sz
+        else:
+            # Complete miss: insert as cold test item
+            self.cold[obj_id] = sz
+            self.cold_bytes += sz
+        self.queue[obj_id] = sz
+
+    def _ghost_add(self, obj_id, sz):
+        self.ghost[obj_id] = sz
+        while len(self.ghost) > self.ghost_max:
+            self.ghost.popitem(last=False)
+
+    def _demote_hot(self):
+        """Demote LRU hot item to cold test (without visited bit)."""
+        if not self.hot:
+            return
+        obj_id, sz = self.hot.popitem(last=False)
+        self.hot_bytes -= sz
+        self.cold[obj_id] = sz
+        self.cold_bytes += sz
+        # Demoted items do NOT get visited bit → evictable on next sweep
+
+    def evict(self, req):
+        if not self.queue:
+            return 0
+
+        # Phase 1: Maintain hot/cold balance via demotion
+        while self.hot_bytes > self._hot_target() and self.hot:
+            self._demote_hot()
+
+        # Phase 2: Sweep cold FIFO for eviction victim
+        # Visited items are promoted to hot; non-visited items are evicted
+        max_attempts = len(self.queue) * 2 + 2
+        attempts = 0
+        while self.cold and attempts < max_attempts:
+            attempts += 1
+            obj_id = next(iter(self.cold))
+
+            if obj_id in self.cold_visited:
+                # Cold item was re-accessed during test → promote to hot
+                sz = self.cold.pop(obj_id)
+                self.cold_bytes -= sz
+                self.cold_visited.discard(obj_id)
+                self.hot[obj_id] = sz
+                self.hot_bytes += sz
+                # Rebalance: demote from hot if needed
+                while self.hot_bytes > self._hot_target() and self.hot:
+                    self._demote_hot()
+                continue
+
+            # Not visited → test complete, evict this cold item
+            sz = self.cold.pop(obj_id)
+            self.cold_bytes -= sz
+            self.queue.pop(obj_id, None)
+
+            # Gentle decrease: cold test was sufficient for this item
+            step = max(1, self.cache_size // 200)
+            self.cold_target = max(self.min_cold, self.cold_target - step)
+
+            self._ghost_add(obj_id, sz)
+            return obj_id
+
+        # Phase 3: Fallback — evict LRU from hot
+        if self.hot:
+            obj_id, sz = self.hot.popitem(last=False)
+            self.hot_bytes -= sz
+            self.queue.pop(obj_id, None)
+            return obj_id
+
+        # Emergency fallback
+        obj_id = next(iter(self.queue))
+        self.queue.pop(obj_id, None)
+        if obj_id in self.cold:
+            self.cold_bytes -= self.cold.pop(obj_id)
+        self.cold_visited.discard(obj_id)
+        return obj_id
+
+    def on_remove(self, obj_id):
+        if obj_id in self.hot:
+            self.hot_bytes -= self.hot.pop(obj_id)
+        elif obj_id in self.cold:
+            self.cold_bytes -= self.cold.pop(obj_id)
+            self.cold_visited.discard(obj_id)
+        self.queue.pop(obj_id, None)
+
+class S3LIRSCache:
+    """
+    S3-LIRS hybrid cache.
+
+    Structure
+    ---------
+    1) Q0: tiny FIFO probation for first-touch objects
+    2) Main cache:
+       - LIR: protected objects
+       - HIR: resident cold objects
+    3) Non-resident history:
+       - G0: ghost of Q0 evictions
+       - G : ghost of HIR evictions, storing a warm reentry score
+       - stack-based HIR_NONRES entries for LIRS-style reuse evidence
+
+    Policy
+    ------
+    - First touch enters Q0.
+    - A hit in Q0 promotes into resident HIR with warm score, not directly to LIR.
+    - Resident HIR objects require stronger evidence before promotion to LIR.
+    - Resident HIR eviction is value-aware:
+          score = (decayed_freq + short_recency_bonus + warm_bonus) / size^alpha
+      Lowest-score HIR resident is evicted.
+    - Stack pruning also deletes stale HIR_NONRES status so history does not leak forever.
+
+    Notes
+    -----
+    - cache_size is byte capacity.
+    - queue mirrors all resident objects.
+    - The simulator is expected to call evict() repeatedly until enough space exists.
+    """
+
+    def __init__(
+        self,
+        cache_size: int,
+        q0_frac: float = 0.08,
+        lir_frac: float = 0.90,
+        decay: float = 0.95,
+        size_exp: float = 0.50,
+        ghost_boost: float = 2.5,
+        recent_bonus: float = 0.25,
+        recent_window: int = 1024,
+        q0_hit_warm: float = 2.0,
+        hir_promote_hits: int = 2,
+        g0_max: int = 100_000,
+        ghost_max: int = 200_000,
+        stack_trim_factor: int = 6,
+        stack_trim_min: int = 20_000,
+    ):
+        self.cache_size = cache_size
+
+        # Front-end probation
+        self.q0_target = max(1, int(cache_size * q0_frac))
+
+        # Main-body target
+        self.lir_frac = lir_frac
+
+        # Tunables
+        self.decay = decay
+        self.size_exp = size_exp
+        self.ghost_boost = ghost_boost
+        self.recent_bonus = recent_bonus
+        self.recent_window = max(1, recent_window)
+        self.q0_hit_warm = q0_hit_warm
+        self.hir_promote_hits = max(1, hir_promote_hits)
+
+        self.g0_max = g0_max
+        self.ghost_max = ghost_max
+        self.stack_trim_factor = max(2, stack_trim_factor)
+        self.stack_trim_min = max(1000, stack_trim_min)
+
+        # Resident segments
+        self.Q0 = OrderedDict()   # obj_id -> size, FIFO
+        self.LIR = OrderedDict()  # obj_id -> size
+        self.HIR = OrderedDict()  # obj_id -> size
+
+        self.q0_bytes = 0
+        self.lir_bytes = 0
+        self.hir_bytes = 0
+
+        # Ghosts
+        self.G0 = OrderedDict()   # obj_id -> None
+        self.G = OrderedDict()    # obj_id -> warm_score
+
+        # LIRS stack S: bottom at front, top at end
+        # value = True if entry corresponds to current LIR-resident status, else False
+        self.stack = OrderedDict()
+
+        # status[obj_id] = ("Q0" | "LIR" | "HIR_RES" | "HIR_NONRES", size)
+        self.status = {}
+
+        # Resident mirror required by simulator conventions
+        self.queue = {}  # obj_id -> size
+
+        # Frequency / scoring state
+        self.freq = {}         # resident only
+        self.last_touch = {}   # resident only, logical time
+        self.warm = {}         # resident only, warm reentry bonus that decays via freq updates
+
+        # HIR promotion evidence
+        self.hir_hits = {}     # resident HIR only
+
+        # Logical time
+        self.time = 0
+
+        # Lazy heap for HIR victim selection
+        self._heap = []        # (score, ver, obj_id)
+        self._ver = 0
+
+    # -------------------------------------------------------------------------
+    # Capacity targets
+    # -------------------------------------------------------------------------
+
+    def _main_capacity(self) -> int:
+        return max(1, self.cache_size - self.q0_target)
+
+    def _lir_target(self) -> int:
+        return max(1, int(self._main_capacity() * self.lir_frac))
+
+    # -------------------------------------------------------------------------
+    # Generic helpers
+    # -------------------------------------------------------------------------
+
+    def _ghost_add(self, ghost: OrderedDict, obj_id: int, limit: int, value=None):
+        ghost.pop(obj_id, None)
+        ghost[obj_id] = value
+        while len(ghost) > limit:
+            ghost.popitem(last=False)
+
+    def _stack_move_top(self, obj_id: int, is_lir: bool):
+        self.stack.pop(obj_id, None)
+        self.stack[obj_id] = is_lir
+
+    def _record_touch(self, obj_id: int):
+        self.time += 1
+        self.last_touch[obj_id] = self.time
+
+    def _recent_bonus_for(self, obj_id: int) -> float:
+        last = self.last_touch.get(obj_id)
+        if last is None:
+            return 0.0
+        return self.recent_bonus if (self.time - last) <= self.recent_window else 0.0
+
+    # -------------------------------------------------------------------------
+    # Stack maintenance
+    # -------------------------------------------------------------------------
+
+    def _stack_prune(self):
+        """
+        Remove bottom non-LIR entries until the bottom is a current LIR entry,
+        deleting stale HIR_NONRES metadata when pruned.
+        """
+        while self.stack:
+            bot_id, bot_is_lir = next(iter(self.stack.items()))
+            if bot_is_lir:
+                break
+
+            self.stack.popitem(last=False)
+            st = self.status.get(bot_id)
+            if st is not None and st[0] == "HIR_NONRES":
+                self.status.pop(bot_id, None)
+
+    def _trim_stack_if_needed(self):
+        """
+        Trim stack length under pressure, but never trim away a bottom LIR entry.
+        Remove stale HIR_NONRES status when discarding nonresident history.
+        """
+        max_len = max(len(self.queue) * self.stack_trim_factor, self.stack_trim_min)
+        while len(self.stack) > max_len:
+            bot_id, bot_is_lir = next(iter(self.stack.items()))
+            st = self.status.get(bot_id)
+
+            if bot_is_lir or (st is not None and st[0] == "LIR"):
+                break
+
+            self.stack.popitem(last=False)
+            if st is not None and st[0] == "HIR_NONRES":
+                self.status.pop(bot_id, None)
+
+    # -------------------------------------------------------------------------
+    # Frequency / scoring
+    # -------------------------------------------------------------------------
+
+    def _score(self, obj_id: int, size: int) -> float:
+        freq = self.freq.get(obj_id, 1.0)
+        warm = self.warm.get(obj_id, 0.0)
+        bonus = self._recent_bonus_for(obj_id)
+        return (freq + warm + bonus) / (max(size, 1) ** self.size_exp)
+
+    def _push_score(self, obj_id: int):
+        if obj_id not in self.queue:
+            return
+        self._ver += 1
+        score = self._score(obj_id, self.queue[obj_id])
+        heapq.heappush(self._heap, (score, self._ver, obj_id))
+
+    def _touch_freq(self, obj_id: int, inc: float = 1.0):
+        old = self.freq.get(obj_id, 0.0)
+        self.freq[obj_id] = old * self.decay + inc
+
+        # Warmth decays away after use; prevents permanent ghost privilege
+        if obj_id in self.warm:
+            self.warm[obj_id] *= self.decay
+            if self.warm[obj_id] < 1e-9:
+                self.warm.pop(obj_id, None)
+
+        self._record_touch(obj_id)
+        self._push_score(obj_id)
+
+    # -------------------------------------------------------------------------
+    # Admission helpers
+    # -------------------------------------------------------------------------
+
+    def _insert_q0(self, obj_id: int, size: int):
+        self.Q0[obj_id] = size
+        self.q0_bytes += size
+        self.queue[obj_id] = size
+        self.status[obj_id] = ("Q0", size)
+
+        self.freq[obj_id] = 1.0
+        self.warm.pop(obj_id, None)
+        self.hir_hits.pop(obj_id, None)
+        self._record_touch(obj_id)
+
+        # Track first touch in stack as non-LIR
+        self._stack_move_top(obj_id, False)
+
+    def _admit_to_hir(self, obj_id: int, size: int, warm_score: float = 0.0):
+        self.HIR[obj_id] = size
+        self.hir_bytes += size
+        self.queue[obj_id] = size
+        self.status[obj_id] = ("HIR_RES", size)
+
+        self.freq[obj_id] = max(self.freq.get(obj_id, 0.0), 1.0)
+        if warm_score > 0.0:
+            self.warm[obj_id] = max(self.warm.get(obj_id, 0.0), warm_score)
+        else:
+            self.warm.pop(obj_id, None)
+
+        self.hir_hits[obj_id] = 0
+        self._record_touch(obj_id)
+        self._stack_move_top(obj_id, False)
+        self._push_score(obj_id)
+
+        # Bootstrap LIR set if empty
+        if self.lir_bytes == 0:
+            self._promote_hir_to_lir(obj_id)
+
+    # -------------------------------------------------------------------------
+    # LIRS transitions
+    # -------------------------------------------------------------------------
+
+    def _demote_lir_bottom(self):
+        """
+        Demote the bottom LIR stack entry to resident HIR.
+        """
+        while self.stack:
+            bot_id, _ = next(iter(self.stack.items()))
+            self.stack.popitem(last=False)
+
+            st = self.status.get(bot_id)
+            if st is None or st[0] != "LIR":
+                if st is not None and st[0] == "HIR_NONRES":
+                    self.status.pop(bot_id, None)
+                continue
+
+            size = st[1]
+
+            self.LIR.pop(bot_id, None)
+            self.lir_bytes -= size
+
+            self.HIR[bot_id] = size
+            self.hir_bytes += size
+            self.status[bot_id] = ("HIR_RES", size)
+            self.hir_hits[bot_id] = 0
+
+            self.stack[bot_id] = False
+            self._push_score(bot_id)
+            self._stack_prune()
+            return
+
+    def _promote_hir_to_lir(self, obj_id: int):
+        st = self.status.get(obj_id)
+        if st is None or st[0] != "HIR_RES":
+            return
+
+        size = st[1]
+
+        self.HIR.pop(obj_id, None)
+        self.hir_bytes -= size
+        self.hir_hits.pop(obj_id, None)
+
+        self.LIR[obj_id] = size
+        self.lir_bytes += size
+        self.status[obj_id] = ("LIR", size)
+        self._stack_move_top(obj_id, True)
+
+        while self.lir_bytes > self._lir_target():
+            self._demote_lir_bottom()
+
+    def _rebalance_main(self):
+        while self.lir_bytes > self._lir_target():
+            self._demote_lir_bottom()
+
+    # -------------------------------------------------------------------------
+    # Eviction helpers
+    # -------------------------------------------------------------------------
+
+    def _cleanup_resident_metadata(self, obj_id: int):
+        self.queue.pop(obj_id, None)
+        self.freq.pop(obj_id, None)
+        self.last_touch.pop(obj_id, None)
+        self.warm.pop(obj_id, None)
+        self.hir_hits.pop(obj_id, None)
+
+    def _evict_q0(self):
+        obj_id, size = self.Q0.popitem(last=False)
+        self.q0_bytes -= size
+
+        self._cleanup_resident_metadata(obj_id)
+        self.status.pop(obj_id, None)
+
+        self._ghost_add(self.G0, obj_id, self.g0_max, None)
+        return obj_id
+
+    def _evict_hir_value(self):
+        """
+        Evict the lowest-value resident HIR using lazy heap validation.
+        """
+        while self._heap:
+            heap_score, _, obj_id = heapq.heappop(self._heap)
+
+            st = self.status.get(obj_id)
+            if st is None or st[0] != "HIR_RES" or obj_id not in self.queue:
+                continue
+
+            cur_size = self.queue[obj_id]
+            cur_score = self._score(obj_id, cur_size)
+
+            # Stale entry: refresh and continue.
+            if abs(cur_score - heap_score) > 1e-12:
+                self._push_score(obj_id)
+                continue
+
+            self.HIR.pop(obj_id, None)
+            self.hir_bytes -= cur_size
+
+            warm_score = min(
+                max(self.freq.get(obj_id, 1.0) + self.warm.get(obj_id, 0.0), 1.0),
+                self.ghost_boost * 2.0,
+            )
+
+            self._cleanup_resident_metadata(obj_id)
+            self.status[obj_id] = ("HIR_NONRES", cur_size)
+            self._ghost_add(self.G, obj_id, self.ghost_max, warm_score)
+            return obj_id
+
+        # Fallback: oldest resident HIR
+        if self.HIR:
+            obj_id, size = self.HIR.popitem(last=False)
+            self.hir_bytes -= size
+
+            warm_score = min(
+                max(self.freq.get(obj_id, 1.0) + self.warm.get(obj_id, 0.0), 1.0),
+                self.ghost_boost * 2.0,
+            )
+
+            self._cleanup_resident_metadata(obj_id)
+            self.status[obj_id] = ("HIR_NONRES", size)
+            self._ghost_add(self.G, obj_id, self.ghost_max, warm_score)
+            return obj_id
+
+        return None
+
+    # -------------------------------------------------------------------------
+    # Simulator API
+    # -------------------------------------------------------------------------
+
+    def on_hit(self, req):
+        obj_id = req.obj_id
+        st = self.status.get(obj_id)
+        if st is None:
+            return
+
+        typ, size = st
+
+        if typ == "Q0":
+            # Q0 hit: prove some value, but do not jump directly to LIR.
+            self.Q0.pop(obj_id, None)
+            self.q0_bytes -= size
+            self.status.pop(obj_id, None)
+
+            self._touch_freq(obj_id, 1.0)
+            self._admit_to_hir(obj_id, size, warm_score=self.q0_hit_warm)
+
+        elif typ == "LIR":
+            self._touch_freq(obj_id, 1.0)
+            self.LIR.move_to_end(obj_id)
+            self._stack_move_top(obj_id, True)
+            self._stack_prune()
+
+        elif typ == "HIR_RES":
+            self._touch_freq(obj_id, 1.0)
+            self.HIR.move_to_end(obj_id)
+            self._stack_move_top(obj_id, False)
+
+            self.hir_hits[obj_id] = self.hir_hits.get(obj_id, 0) + 1
+            if self.hir_hits[obj_id] >= self.hir_promote_hits:
+                self._promote_hir_to_lir(obj_id)
+
+            self._stack_prune()
+
+        self._trim_stack_if_needed()
+
+    def on_miss(self, req):
+        if req.obj_size > self.cache_size:
+            return
+
+        obj_id = req.obj_id
+        size = req.obj_size
+
+        # Defensive
+        if obj_id in self.queue:
+            return
+
+        # Q0 ghost hit -> warm admit to HIR
+        if obj_id in self.G0:
+            self.G0.pop(obj_id, None)
+            self._admit_to_hir(obj_id, size, warm_score=self.ghost_boost)
+            self._trim_stack_if_needed()
+            return
+
+        # Main ghost hit -> warm admit to HIR using remembered strength
+        warm_score = self.G.pop(obj_id, None)
+        if warm_score is not None:
+            self._admit_to_hir(obj_id, size, warm_score=warm_score)
+            self._trim_stack_if_needed()
+            return
+
+        # Nonresident stack history -> warm-ish admit to HIR
+        st = self.status.get(obj_id)
+        if st is not None and st[0] == "HIR_NONRES":
+            self._admit_to_hir(obj_id, size, warm_score=self.ghost_boost)
+            self._trim_stack_if_needed()
+            return
+
+        # Cold first touch
+        self._insert_q0(obj_id, size)
+        self._trim_stack_if_needed()
+
+    def evict(self, req):
+        if not self.queue:
+            return 0
+
+        # 1. Keep Q0 tiny
+        if self.Q0 and self.q0_bytes > self.q0_target:
+            return self._evict_q0()
+
+        # 2. Maintain LIR/HIR balance
+        self._rebalance_main()
+
+        # 3. Prefer HIR victim
+        victim = self._evict_hir_value()
+        if victim is not None:
+            return victim
+
+        # 4. If only Q0 exists
+        if self.Q0:
+            return self._evict_q0()
+
+        # 5. Rare fallback: evict oldest LIR
+        if self.LIR:
+            obj_id, size = self.LIR.popitem(last=False)
+            self.lir_bytes -= size
+
+            self._cleanup_resident_metadata(obj_id)
+            self.status.pop(obj_id, None)
+            self.stack.pop(obj_id, None)
+            self._stack_prune()
+            return obj_id
+
+        # 6. Emergency fallback
+        obj_id = next(iter(self.queue))
+        self.on_remove(obj_id)
+        return obj_id
+
+    def on_remove(self, obj_id):
+        st = self.status.pop(obj_id, None)
+
+        if st is not None:
+            typ, _ = st
+            if typ == "Q0":
+                size = self.Q0.pop(obj_id, None)
+                if size is not None:
+                    self.q0_bytes -= size
+            elif typ == "LIR":
+                size = self.LIR.pop(obj_id, None)
+                if size is not None:
+                    self.lir_bytes -= size
+            elif typ == "HIR_RES":
+                size = self.HIR.pop(obj_id, None)
+                if size is not None:
+                    self.hir_bytes -= size
+
+        self._cleanup_resident_metadata(obj_id)
+
+        if obj_id in self.stack:
+            # Remove current stack entry entirely on external removal.
+            self.stack.pop(obj_id, None)
+
+        self._stack_prune()
+        self._trim_stack_if_needed()
+
+class EffectiveIRRCache:
+    """
+    Effective-IRR cache.
+
+    score = freq / max(measured_irr, time_since_last_access, 1) / size^alpha
+
+    Combines reuse-distance signal (via IRR) with frequency,
+    using pessimistic IRR for natural staleness handling.
+    Ghost list with remembered (freq, irr) for warm readmission.
+    Periodic frequency halving for phase-change robustness.
+    """
+
+    def __init__(self, cache_size, size_exp=0.5, halve_interval=0, ghost_max=200_000):
+        import heapq
+        self.cache_size = cache_size
+        self.size_exp = size_exp
+        self.halve_interval = halve_interval if halve_interval > 0 else max(10000, cache_size * 2)
+        self._heapq = heapq
+        self._time = 0
+        self._miss_count = 0
+
+        # obj_id -> (size, freq, measured_irr, last_access, ver)
+        self.items = {}
+        self.queue = {}
+        self.heap = []
+        self._ver = 0
+
+        # Ghost: obj_id -> (freq, measured_irr)
+        self.ghost = OrderedDict()
+        self.ghost_max = ghost_max
+
+    def _eff_irr(self, measured_irr, last_access):
+        return max(measured_irr, self._time - last_access, 1)
+
+    def _score(self, freq, measured_irr, size, last_access):
+        eirr = self._eff_irr(measured_irr, last_access)
+        return max(freq, 1) / eirr / (max(size, 1) ** self.size_exp)
+
+    def _push(self, obj_id):
+        rec = self.items.get(obj_id)
+        if rec is None:
+            return
+        size, freq, mirr, la, _ = rec
+        self._ver += 1
+        s = self._score(freq, mirr, size, la)
+        self.items[obj_id] = (size, freq, mirr, la, self._ver)
+        self._heapq.heappush(self.heap, (s, self._ver, obj_id))
+
+    def _halve_all(self):
+        for oid in list(self.items.keys()):
+            size, freq, mirr, la, _ = self.items[oid]
+            self.items[oid] = (size, max(1, freq >> 1), mirr, la, 0)
+        self.heap = []
+        self._ver = 0
+        for oid in self.items:
+            self._push(oid)
+
+    def on_hit(self, req):
+        self._time += 1
+        rec = self.items.get(req.obj_id)
+        if rec is None:
+            return
+        size, freq, mirr, la, _ = rec
+        new_irr = self._time - la
+        size = req.obj_size or size
+        self.items[req.obj_id] = (size, freq + 1, new_irr, self._time, 0)
+        self._push(req.obj_id)
+
+    def on_miss(self, req):
+        if req.obj_size > self.cache_size:
+            return
+        self._time += 1
+        obj_id, size = req.obj_id, req.obj_size
+
+        self._miss_count += 1
+        if self._miss_count >= self.halve_interval:
+            self._miss_count = 0
+            self._halve_all()
+
+        ghost_info = self.ghost.pop(obj_id, None)
+        if ghost_info is not None:
+            g_freq, g_irr = ghost_info
+            freq = max(g_freq, 1) + 1
+            irr = g_irr
+        else:
+            freq = 1
+            irr = self._time  # large → low priority (scan-resistant)
+
+        self.items[obj_id] = (size, freq, irr, self._time, 0)
+        self.queue[obj_id] = size
+        self._push(obj_id)
+
+    def evict(self, req):
+        if not self.queue:
+            return 0
+        while self.heap:
+            s, ver, obj_id = self.heap[0]
+            rec = self.items.get(obj_id)
+            if rec is None:
+                self._heapq.heappop(self.heap)
+                continue
+            if ver != rec[4]:
+                self._heapq.heappop(self.heap)
+                continue
+            # Recompute with current effective IRR
+            cur_s = self._score(rec[1], rec[2], rec[0], rec[3])
+            # Score can only have decreased; if it decreased substantially,
+            # re-push so we don't miss a truly lower-scored item
+            if cur_s > s * 1.01:
+                # Shouldn't happen (scores only decrease), but handle gracefully
+                self._heapq.heappop(self.heap)
+                self._push(obj_id)
+                continue
+            if s > cur_s * 1.5 and len(self.heap) > 1:
+                # Score dropped a lot; there might be something lower now
+                self._heapq.heappop(self.heap)
+                self._push(obj_id)
+                continue
+            self._heapq.heappop(self.heap)
+            freq, mirr = rec[1], rec[2]
+            self.items.pop(obj_id)
+            self.queue.pop(obj_id)
+            self.ghost[obj_id] = (freq, mirr)
+            while len(self.ghost) > self.ghost_max:
+                self.ghost.popitem(last=False)
+            return obj_id
+        obj_id = next(iter(self.queue))
+        rec = self.items.pop(obj_id, None)
+        self.queue.pop(obj_id)
+        if rec:
+            self.ghost[obj_id] = (rec[1], rec[2])
+            while len(self.ghost) > self.ghost_max:
+                self.ghost.popitem(last=False)
+        return obj_id
+
+    def on_remove(self, obj_id):
+        self.items.pop(obj_id, None)
+        self.queue.pop(obj_id, None)
+
 def init_hook(common_cache_params: CommonCacheParams):
     cs = common_cache_params.cache_size
 
-    return GDSFFrequencyCache(cs)
+    return EffectiveIRRCache(cs)
 
 
 def hit_hook(data, req: Request):

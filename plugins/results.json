@@ -1,40 +1,71 @@
 {
     "Best": {
         "trace_0, 7027": {
-            "LIRS": "0.6660, 6/7"
+            "ARC": "0.6751, 6/7",
+            "LIRS": "0.6660, 6/7",
+            "ARCRestricted": "0.6764, 6/7",
+            "ARCFreq": "0.6751, 6/7"
         },
         "trace_0, 70273": {
-            "S3ARC": "0.4468, 5/7"
+            "SIEVEReinsert": "0.4478, 5/7",
+            "S3ARC": "0.4468, 5/7",
+            "SIEVEKReinsert": "0.4463, 5/7",
+            "S3LIRS": "0.4475, 5/7"
         },
         "trace_1, 1241": {
-            "ARCFreq": "0.7325, 3/7"
+            "S3FIFOTuned": "0.7344, 3/7",
+            "ARC": "0.7326, 3/7",
+            "ARCRestricted": "0.7330, 3/7",
+            "ARCFreq": "0.7325, 3/7",
+            "CLOCKPro": "0.7441, 3/7"
         },
         "trace_1, 12414": {
+            "ARC": "0.4375, 6/7",
             "ARCFreq": "0.4373, 6/7"
         },
         "trace_2, 3762": {
-            "ARCRestricted": "0.7198, 5/7"
+            "ARC": "0.7212, 5/7",
+            "ARCRestricted": "0.7198, 5/7",
+            "ARCFreq": "0.7212, 5/7"
         },
         "trace_2, 37627": {
-            "LIRS": "0.3467, 5/7"
+            "LIRS": "0.3467, 5/7",
+            "Multiqueue": "0.3580, 5/7"
         },
         "trace_3, 728": {
-            "ARC": "0.5784, 6/7"
+            "ARC": "0.5784, 6/7",
+            "ARCRestricted": "0.5801, 6/7",
+            "ARCFreq": "0.5785, 6/7"
         },
         "trace_3, 7282": {
             "LIRS": "0.1585, 5/7"
         },
         "trace_4, 4263": {
-            "GDSFDecayReinsert(0.95,3.5,50k)": "0.4147, 6/7"
+            "GDSFDecay(0.9)": "0.4167, 6/7",
+            "GDSFDecayReinsert(0.9,3.0,50k)": "0.4154, 6/7",
+            "GDSFDecayReinsert(0.95,3.5,50k)": "0.4147, 6/7",
+            "ARCRestricted": "0.4162, 6/7"
         },
         "trace_4, 42632": {
+            "GDSFDecayReinsert(0.9,3.0,50k)": "0.1543, 5/7",
+            "GDSFDecayReinsert(0.95,3.5,50k)": "0.1403, 5/7",
             "LIRS": "0.1268, 5/7"
         },
         "trace_5, 4915": {
-            "SIEVEReinsert": "0.7533, 5/7"
+            "GDSF": "0.7546, 5/7",
+            "SIEVEReinsert": "0.7533, 5/7",
+            "S3SIEVE": "0.7550, 5/7",
+            "SIEVEKReinsert": "0.7531, 5/7",
+            "GDSFFrequency": "0.7542, 5/7"
         },
         "trace_5, 49156": {
-            "SIEVEReinsert": "0.1998, 4/7"
+            "GDSF": "0.2028, 4/7",
+            "SIEVEReinsert": "0.1998, 4/7",
+            "S3SIEVE": "0.2034, 4/7",
+            "GDSFDecayReinsert(0.9,2.0,150k)": "0.2008, 4/7",
+            "GDSFDecayReinsert(0.9,3.0,50k)": "0.2010, 4/7",
+            "SIEVEKReinsert": "0.2004, 4/7",
+            "GDSFFrequency": "0.2004, 4/7"
         },
         "trace_6, 7555": {
             "LIRS": "0.6256, 5/7"
@@ -43,13 +74,19 @@
             "S3ARC": "0.3423, 6/7"
         },
         "trace_7, 1646": {
+            "GDSFDecay(0.95)": "0.3149, 5/7",
+            "GDSFDecayReinsert(0.9,3.0,50k)": "0.2786, 5/7",
+            "GDSFDecayReinsert(0.95,3.5,50k)": "0.251, 5/7",
             "LIRS": "0.1656, 5/7"
         },
         "trace_7, 16460": {
             "LIRS": "0.0808, 6/7"
         },
         "trace_8, 3225": {
-            "GDSF": "0.7506, 6/7"
+            "GDSF": "0.7506, 6/7",
+            "GDSFDecay(0.97)": "0.7507, 6/7",
+            "ARCRestricted": "0.7509, 6/7",
+            "ARCFreq": "0.7512, 6/7"
         },
         "trace_8, 32254": {
             "LIRS": "0.4742, 5/7"
@@ -58,7 +95,11 @@
             "LIRS": "0.7100, 6/7"
         },
         "trace_9, 71647": {
-            "GDSF": "0.3687, 6/7"
+            "GDSF": "0.3687, 6/7",
+            "GDSFDecay(0.9)": "0.3706, 6/7",
+            "GDSFDecay(0.97)": "0.3697, 6/7",
+            "GDSFDecayReinsert(0.9,3.0,50k)": "0.3741, 6/7",
+            "GDSFFrequency": "0.3714, 6/7"
         }
     },
     "trace_0, 7027": {
@@ -79,7 +120,13 @@
         "ARCSmoothed": "0.7116, 1/7",
         "S3ARC": "0.6976, 3/7",
         "LFUAge": "0.7060, 3/7",
-        "ARCFreq": "0.6751, 6/7"
+        "ARCFreq": "0.6751, 6/7",
+        "SIEVEKReinsert": "0.6998, 3/7",
+        "GDSFFrequency": "0.6960, 3/7",
+        "Hyperbolic": "0.8187, 0/7",
+        "Multiqueue": "0.6974, 3/7",
+        "CLOCKPro": "0.7018, 3/7",
+        "S3LIRS": "0.7133, 1/7"
     },
     "trace_0, 70273": {
         "FIFO": "0.4932, 0/7",
@@ -99,7 +146,13 @@
         "ARCSmoothed": "0.4726, 2/7",
         "S3ARC": "0.4468, 5/7",
         "LFUAge": "0.4736, 2/7",
-        "ARCFreq": "0.4524, 4/7"
+        "ARCFreq": "0.4524, 4/7",
+        "SIEVEKReinsert": "0.4463, 5/7",
+        "GDSFFrequency": "0.4717, 2/7",
+        "Hyperbolic": "0.5801, 0/7",
+        "Multiqueue": "0.4764, 1/7",
+        "CLOCKPro": "0.4614, 4/7",
+        "S3LIRS": "0.4475, 5/7"
     },
     "trace_1, 1241": {
         "FIFO": "0.7597, 0/7",
@@ -119,7 +172,13 @@
         "ARCSmoothed": "0.7432, 2/7",
         "S3ARC": "0.7392, 2/7",
         "LFUAge": "0.7405, 2/7",
-        "ARCFreq": "0.7325, 3/7"
+        "ARCFreq": "0.7325, 3/7",
+        "SIEVEKReinsert": "0.7425, 2/7",
+        "GDSFFrequency": "0.7401, 2/7",
+        "Hyperbolic": "0.8130, 0/7",
+        "Multiqueue": "0.7443, 2/7",
+        "CLOCKPro": "0.7441, 3/7",
+        "S3LIRS": "0.7529, 1/7"
     },
     "trace_1, 12414": {
         "FIFO": "0.4509, 3/7",
@@ -139,7 +198,13 @@
         "ARCSmoothed": "0.4530, 3/7",
         "S3ARC": "0.6711, 2/7",
         "LFUAge": "0.5536, 3/7",
-        "ARCFreq": "0.4373, 6/7"
+        "ARCFreq": "0.4373, 6/7",
+        "SIEVEKReinsert": "0.4993, 3/7",
+        "GDSFFrequency": "0.4621, 3/7",
+        "Hyperbolic": "0.5695, 3/7",
+        "Multiqueue": "0.5183, 3/7",
+        "CLOCKPro": "0.4603, 3/7",
+        "S3LIRS": "0.6412, 2/7"
     },
     "trace_2, 3762": {
         "FIFO": "0.7560, 0/7",
@@ -159,7 +224,13 @@
         "ARCSmoothed": "0.7504, 1/7",
         "S3ARC": "0.7369, 2/7",
         "LFUAge": "0.7512, 1/7",
-        "ARCFreq": "0.7212, 5/7"
+        "ARCFreq": "0.7212, 5/7",
+        "SIEVEKReinsert": "0.7399, 2/7",
+        "GDSFFrequency": "0.7402, 2/7",
+        "Hyperbolic": "0.8460, 0/7",
+        "Multiqueue": "0.7501, 1/7",
+        "CLOCKPro": "0.7429, 3/7",
+        "S3LIRS": "0.8419, 0/7"
     },
     "trace_2, 37627": {
         "FIFO": "0.5926, 2/7",
@@ -179,7 +250,13 @@
         "ARCSmoothed": "0.5242, 3/7",
         "S3ARC": "0.6811, 1/7",
         "LFUAge": "0.4697, 3/7",
-        "ARCFreq": "0.5032, 3/7"
+        "ARCFreq": "0.5032, 3/7",
+        "SIEVEKReinsert": "0.5101, 3/7",
+        "GDSFFrequency": "0.6520, 1/7",
+        "Hyperbolic": "0.6336, 1/7",
+        "Multiqueue": "0.3580, 5/7",
+        "CLOCKPro": "0.5625, 3/7",
+        "S3LIRS": "0.7037, 0/7"
     },
     "trace_3, 728": {
         "FIFO": "0.6747, 0/7",
@@ -199,7 +276,13 @@
         "ARCSmoothed": "0.6403, 2/7",
         "S3ARC": "0.6472, 2/7",
         "LFUAge": "0.7028, 0/7",
-        "ARCFreq": "0.5785, 6/7"
+        "ARCFreq": "0.5785, 6/7",
+        "SIEVEKReinsert": "0.6454, 2/7",
+        "GDSFFrequency": "0.6357, 2/7",
+        "Hyperbolic": "0.7279, 0/7",
+        "Multiqueue": "0.6360, 2/7",
+        "CLOCKPro": "0.6349, 3/7",
+        "S3LIRS": "0.6703, 1/7"
     },
     "trace_3, 7282": {
         "FIFO": "0.4980, 2/7",
@@ -219,7 +302,13 @@
         "ARCSmoothed": "0.4570, 3/7",
         "S3ARC": "0.5424, 1/7",
         "LFUAge": "0.1802, 3/7",
-        "ARCFreq": "0.1630, 4/7"
+        "ARCFreq": "0.1630, 4/7",
+        "SIEVEKReinsert": "0.4334, 3/7",
+        "GDSFFrequency": "0.4729, 3/7",
+        "Hyperbolic": "0.4115, 3/7",
+        "Multiqueue": "0.1626, 4/7",
+        "CLOCKPro": "0.4555, 3/7",
+        "S3LIRS": "0.4672, 3/7"
     },
     "trace_4, 4263": {
         "FIFO": "0.4872, 0/7",
@@ -240,7 +329,13 @@
         "ARCSmoothed": "0.4796, 1/7",
         "S3ARC": "0.4344, 4/7",
         "LFUAge": "0.4313, 4/7",
-        "ARCFreq": "0.4192, 5/7"
+        "ARCFreq": "0.4192, 5/7",
+        "SIEVEKReinsert": "0.4283, 4/7",
+        "GDSFFrequency": "0.4173, 5/7",
+        "Hyperbolic": "0.7927, 0/7",
+        "Multiqueue": "0.5528, 0/7",
+        "CLOCKPro": "0.4519, 2/7",
+        "S3LIRS": "0.7515, 0/7"
     },
     "trace_4, 42632": {
         "FIFO": "0.3061, 2/7",
@@ -261,7 +356,13 @@
         "ARCSmoothed": "0.2874, 3/7",
         "S3ARC": "0.3671, 1/7",
         "LFUAge": "0.3038, 3/7",
-        "ARCFreq": "0.2989, 3/7"
+        "ARCFreq": "0.2989, 3/7",
+        "SIEVEKReinsert": "0.2403, 3/7",
+        "GDSFFrequency": "0.2482, 3/7",
+        "Hyperbolic": "0.4312, 0/7",
+        "Multiqueue": "0.1976, 3/7",
+        "CLOCKPro": "0.3195, 3/7",
+        "S3LIRS": "0.4742, 0/7"
     },
     "trace_5, 4915": {
         "FIFO": "0.7751, 0/7",
@@ -281,7 +382,13 @@
         "ARCSmoothed": "0.7805, 0/7",
         "S3ARC": "0.7581, 4/7",
         "LFUAge": "0.7597, 3/7",
-        "ARCFreq": "0.7565, 4/7"
+        "ARCFreq": "0.7565, 4/7",
+        "SIEVEKReinsert": "0.7531, 5/7",
+        "GDSFFrequency": "0.7542, 5/7",
+        "Hyperbolic": "0.9220, 0/7",
+        "Multiqueue": "0.8403, 0/7",
+        "CLOCKPro": "0.7600, 3/7",
+        "S3LIRS": "0.8061, 0/7"
     },
     "trace_5, 49156": {
         "FIFO": "0.4709, 0/7",
@@ -301,7 +408,13 @@
         "ARCSmoothed": "0.2155, 3/7",
         "S3ARC": "0.2403, 2/7",
         "LFUAge": "0.2340, 2/7",
-        "ARCFreq": "0.2258, 3/7"
+        "ARCFreq": "0.2258, 3/7",
+        "SIEVEKReinsert": "0.2004, 4/7",
+        "GDSFFrequency": "0.2004, 4/7",
+        "Hyperbolic": "0.6151, 0/7",
+        "Multiqueue": "0.2628, 1/7",
+        "CLOCKPro": "0.2183, 3/7",
+        "S3LIRS": "0.2416, 2/7"
     },
     "trace_6, 7555": {
         "FIFO": "0.6494, 0/7",
@@ -321,7 +434,13 @@
         "ARCSmoothed": "0.6486, 1/7",
         "S3ARC": "0.6355, 2/7",
         "LFUAge": "0.6464, 1/7",
-        "ARCFreq": "0.6330, 4/7"
+        "ARCFreq": "0.6330, 4/7",
+        "SIEVEKReinsert": "0.6358, 2/7",
+        "GDSFFrequency": "0.6348, 3/7",
+        "Hyperbolic": "0.8169, 0/7",
+        "Multiqueue": "0.6665, 0/7",
+        "CLOCKPro": "0.6363, 3/7",
+        "S3LIRS": "0.8196, 0/7"
     },
     "trace_6, 75551": {
         "FIFO": "0.3707, 2/7",
@@ -341,7 +460,13 @@
         "ARCSmoothed": "0.3465, 5/7",
         "S3ARC": "0.3423, 6/7",
         "LFUAge": "0.3745, 2/7",
-        "ARCFreq": "0.3726, 2/7"
+        "ARCFreq": "0.3726, 2/7",
+        "SIEVEKReinsert": "0.3757, 2/7",
+        "GDSFFrequency": "0.3876, 1/7",
+        "Hyperbolic": "0.4969, 0/7",
+        "Multiqueue": "0.3732, 2/7",
+        "CLOCKPro": "0.3487, 4/7",
+        "S3LIRS": "0.4417, 0/7"
     },
     "trace_7, 1646": {
         "FIFO": "0.7812, 1/7",
@@ -362,7 +487,13 @@
         "ARCSmoothed": "0.7976, 0/7",
         "S3ARC": "0.7801, 2/7",
         "LFUAge": "0.4104, 3/7",
-        "ARCFreq": "0.6281, 2/7"
+        "ARCFreq": "0.6281, 2/7",
+        "SIEVEKReinsert": "0.5340, 2/7",
+        "GDSFFrequency": "0.3637, 4/7",
+        "Hyperbolic": "0.7046, 2/7",
+        "Multiqueue": "0.7196, 2/7",
+        "CLOCKPro": "0.7789, 3/7",
+        "S3LIRS": "0.3427, 4/7"
     },
     "trace_7, 16460": {
         "FIFO": "0.1153, 0/7",
@@ -382,7 +513,13 @@
         "ARCSmoothed": "0.1078, 1/7",
         "S3ARC": "0.1013, 2/7",
         "LFUAge": "0.1051, 1/7",
-        "ARCFreq": "0.1024, 1/7"
+        "ARCFreq": "0.1024, 1/7",
+        "SIEVEKReinsert": "0.0990, 4/7",
+        "GDSFFrequency": "0.0997, 2/7",
+        "Hyperbolic": "0.5226, 0/7",
+        "Multiqueue": "0.1098, 1/7",
+        "CLOCKPro": "0.1014, 3/7",
+        "S3LIRS": "0.1079, 1/7"
     },
     "trace_8, 3225": {
         "FIFO": "0.7601, 1/7",
@@ -402,7 +539,13 @@
         "ARCSmoothed": "0.7668, 1/7",
         "S3ARC": "0.7536, 3/7",
         "LFUAge": "0.7700, 0/7",
-        "ARCFreq": "0.7512, 6/7"
+        "ARCFreq": "0.7512, 6/7",
+        "SIEVEKReinsert": "0.7539, 3/7",
+        "GDSFFrequency": "0.7505, 6/7",
+        "Hyperbolic": "0.8781, 0/7",
+        "Multiqueue": "0.8230, 0/7",
+        "CLOCKPro": "0.7531, 3/7",
+        "S3LIRS": "0.8227, 0/7"
     },
     "trace_8, 32254": {
         "FIFO": "0.7132, 3/7",
@@ -422,7 +565,13 @@
         "ARCSmoothed": "0.7228, 2/7",
         "S3ARC": "0.7074, 4/7",
         "LFUAge": "0.7191, 2/7",
-        "ARCFreq": "0.7132, 3/7"
+        "ARCFreq": "0.7132, 3/7",
+        "SIEVEKReinsert": "0.7181, 2/7",
+        "GDSFFrequency": "0.6860, 4/7",
+        "Hyperbolic": "0.6731, 4/7",
+        "Multiqueue": "0.8055, 0/7",
+        "CLOCKPro": "0.7147, 3/7",
+        "S3LIRS": "0.7722, 0/7"
     },
     "trace_9, 7164": {
         "FIFO": "0.7330, 0/7",
@@ -442,7 +591,13 @@
         "ARCSmoothed": "0.7324, 1/7",
         "S3ARC": "0.7246, 3/7",
         "LFUAge": "0.7310, 1/7",
-        "ARCFreq": "0.7216, 4/7"
+        "ARCFreq": "0.7216, 4/7",
+        "SIEVEKReinsert": "0.7247, 3/7",
+        "GDSFFrequency": "0.7240, 3/7",
+        "Hyperbolic": "0.8484, 0/7",
+        "Multiqueue": "0.7591, 0/7",
+        "CLOCKPro": "0.7268, 3/7",
+        "S3LIRS": "0.7842, 0/7"
     },
     "trace_9, 71647": {
         "FIFO": "0.4827, 0/7",
@@ -462,6 +617,12 @@
         "ARCSmoothed": "0.4390, 2/7",
         "S3ARC": "0.4375, 2/7",
         "LFUAge": "0.4009, 2/7",
-        "ARCFreq": "0.4295, 2/7"
+        "ARCFreq": "0.4295, 2/7",
+        "SIEVEKReinsert": "0.3805, 5/7",
+        "GDSFFrequency": "0.3714, 6/7",
+        "Hyperbolic": "0.5686, 0/7",
+        "Multiqueue": "0.4000, 2/7",
+        "CLOCKPro": "0.4299, 3/7",
+        "S3LIRS": "0.4011, 2/7"
     }
 }
